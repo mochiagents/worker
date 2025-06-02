@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mochi-worker-agent"
+version = "0.0.1"
+description = "Mochi Worker Agent"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "langchain",
+    "langgraph",
+    "langchain-openai",
+    "langchain-anthropic",
+    "langchain-google-genai",
+    "langchain-community",
+    "coloredlogs",
+    "python-dotenv",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "PyYAML>=5.0",
+    "fastapi",
+    "uvicorn[standard]",
+    "typer[all]",
+    "requests",
+    "pytest",
+    "pytest-asyncio",
+    "sentence-transformers",
+    "torch"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+python_files = "tests.py test_*.py *_tests.py"
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.coverage.run] 

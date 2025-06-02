@@ -1,0 +1,75 @@
+agent_id: "mochi-worker-default-01"
+
+llm_profiles:
+  default_planner:
+    provider: google
+    model: gemini-2.5-flash-preview-05-20
+    temperature: 0.5
+    max_tokens: 32768
+    api_key: YOUR_API_KEY
+    additional_params: {}
+  default_joiner:
+    provider: google
+    model: gemini-2.5-flash-preview-05-20 # gemini-2.5-pro-preview-05-06
+    temperature: 0.7
+    max_tokens: 32768
+    api_key: YOUR_API_KEY
+    additional_params: {}
+
+planner:
+  llm_profile_name: default_planner
+  use_tool_recommendation: true
+  tool_recommendation_llm_profile_name: null
+  embedding_model_name: 'all-MiniLM-L6-v2'
+  semantic_search_include_server_description: false
+  default_planning_strategy: "tool_recommendation_first"
+  max_dag_depth: 5
+  max_sequential_tasks_per_tool: 1
+  semantic_stop_words: null
+  tool_recommendation_top_n: 5
+  semantic_score_min_threshold: 0.1
+
+joiner:
+  llm_profile_name: default_joiner
+  max_replanning_triggers: 1
+  joiner_response_format_instructions: null
+
+mcp_tool_servers:
+  - name: "toolkit"
+    endpoint_url: "http://localhost:8001/mcp"
+    schema_discovery_url: "http://localhost:8001/mcp/schema"
+    request_timeout_seconds: 30
+    max_retries: 3
+    description: "MCP server for Mochi's default toolkit"
+
+# Task Execution Configuration
+execution:
+  max_parallel_tasks: 3
+  max_retries: 2
+  initial_retry_delay_seconds: 1.0
+  retry_backoff_factor: 2.0
+  default_task_execution_timeout_seconds: 60.0
+  min_task_execution_timeout_seconds: 5.0
+  max_task_execution_timeout_seconds: 300.0
+
+# Logging Configuration
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - [%(event_type)s] - %(message)s"
+  date_format: "%Y-%m-%d %H:%M:%S"
+  log_to_console: true
+  log_file: null
+  log_file_max_bytes: 10485760
+  log_file_backup_count: 3
+  log_mcp_calls: true
+
+# Agent General Settings
+agent_settings:
+  max_replanning_loops: 3
+  max_dag_generation_attempts: 3
+  max_context_tokens: 4096
+  state_persistence_dir: null
+  max_replanning_cycles: 3
+  include_debug_info_in_response: false
+  enable_heartbeat: false
+  heartbeat_interval_seconds: 60
