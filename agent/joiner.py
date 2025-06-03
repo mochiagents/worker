@@ -342,7 +342,7 @@ class Joiner:
             self.logger.error(f"Joiner: DAG repair LLM invocation failed. Error: {e}", exc_info=True, event_type="JOINER_REPAIR_LLM_FAILURE")
             return None
 
-    async def process_results(self, query: str, dag: Optional[TaskDAG], task_results: Optional[dict], task_status: Optional[dict], planner_output: Optional[Dict[str, Any]] = None, conversation_context: Optional[str] = None, mcp_clients: Optional[Dict[str, Any]] = None) -> dict:
+    async def process_results(self, query: str, dag: Optional[TaskDAG], task_results: Optional[dict], task_status: Optional[dict], planner_output: Optional[Dict[str, Any]] = None, conversation_context: Optional[str] = None, mcp_clients: Optional[Dict[str, Any]] = None, stream_callback: Optional[Any] = None) -> dict:
         """
         Processes the task results by invoking the LLM.
         If it's a NO_PLAN_CONVERSE query type, it gets a direct conversational response.
@@ -357,6 +357,7 @@ class Joiner:
             planner_output: An optional dictionary containing planner output information, including 'query_type'.
             conversation_context: An optional string containing conversation context.
             mcp_clients: An optional dictionary mapping server IDs to McpClient instances for schema fetching.
+            stream_callback: Optional callback for streaming Joiner's internal reasoning.
 
         Returns:
             A dictionary containing:
@@ -383,6 +384,17 @@ class Joiner:
         query_type_from_planner = planner_output.get("query_type") if planner_output else None
         self.logger.info(f"Joiner: Received query_type from planner_output: {query_type_from_planner}")
 
+        # Stream the Joiner's initial analysis
+        if stream_callback:
+            stream_callback({
+                "event_type": "joiner_analysis_start",
+                "query": query[:100] + "..." if len(query) > 100 else query,
+                "query_type": query_type_from_planner,
+                "total_tasks": len(task_status) if task_status else 0,
+                "completed_tasks": len([s for s in (task_status or {}).values() if s == 'completed']),
+                "failed_tasks": len([s for s in (task_status or {}).values() if s == 'failed'])
+            })
+
         if not self.llm:
             self.logger.error("Joiner: LLM for Joiner is not configured.")
             raise ValueError("LLM for Joiner is not configured. Cannot process results.")
@@ -400,14 +412,50 @@ class Joiner:
             conversation_context=conversation_context
         )
         
+        # Log the full prompt for debugging
+        self.logger.info(f"Joiner: Generated prompt for LLM analysis (length: {len(prompt_string)})")
+        self.logger.debug(f"Joiner: Full prompt content:\n{prompt_string}")
+        
+        if stream_callback:
+            stream_callback({
+                "event_type": "joiner_prompt_generated",
+                "prompt_length": len(prompt_string),
+                "prompt_preview": prompt_string[:300] + "..." if len(prompt_string) > 300 else prompt_string,
+                "full_prompt": prompt_string  # Add the full prompt for detailed debugging
+            })
+        
         content = ""
         try:
             self.logger.info(f"Joiner: Invoking LLM for result synthesis. Prompt (first 200 chars): {prompt_string[:200]}...")
+            if stream_callback:
+                stream_callback({
+                    "event_type": "joiner_llm_invoke_start",
+                    "message": "Joiner is analyzing task results and making decisions..."
+                })
+            
             llm_response_object = await self.llm.ainvoke(prompt_string)
             content = llm_response_object.content if hasattr(llm_response_object, 'content') else str(llm_response_object)
             self.logger.info(f"Joiner: Received LLM response. Length: {len(content)}")
+            
+            # Log the full LLM response for debugging
+            self.logger.info(f"Joiner: Complete LLM response:\n{content}")
+            
+            if stream_callback:
+                stream_callback({
+                    "event_type": "joiner_llm_response_received",
+                    "response_length": len(content),
+                    "full_response": content,
+                    "message": "Joiner received analysis from LLM, parsing response..."
+                })
+            
         except Exception as e:
             self.logger.error(f"Joiner: LLM invocation failed. Error: {e}", exc_info=True)
+            if stream_callback:
+                stream_callback({
+                    "event_type": "joiner_llm_error", 
+                    "error": str(e),
+                    "message": f"Joiner LLM call failed: {e}"
+                })
             return {
                 "error": "LLM_INVOCATION_FAILURE",
                 "details": str(e),
@@ -417,6 +465,12 @@ class Joiner:
 
         if query_type_from_planner == "NO_PLAN_CONVERSE":
             self.logger.info("Joiner: NO_PLAN_CONVERSE type, using LLM output directly as response, no replanning.")
+            if stream_callback:
+                stream_callback({
+                    "event_type": "joiner_direct_response",
+                    "message": "Query type is NO_PLAN_CONVERSE, using direct conversational response",
+                    "response": content.strip()
+                })
             return {
                 "needs_replanning": False,
                 "response": content.strip(),
@@ -429,6 +483,12 @@ class Joiner:
 
         if not content_lines or not content_lines[0].strip():
             self.logger.warning("Joiner: LLM response for planned query was empty or first line was all whitespace. Defaulting to replan.")
+            if stream_callback:
+                stream_callback({
+                    "event_type": "joiner_parsing_error",
+                    "message": "LLM response was empty or malformed, defaulting to replanning",
+                    "issue": "Empty or whitespace first line"
+                })
             initial_needs_replanning = True
             response_for_user_or_explanation = f"LLM output format error (empty or malformed first line). Original output (first 200 chars): '{content.strip()[:200]}...'. Replanning is recommended."
         else:
@@ -437,12 +497,30 @@ class Joiner:
                 initial_needs_replanning = True
                 response_for_user_or_explanation = "\n".join(content_lines[1:]).strip()
                 self.logger.info("Joiner: REPLAN: YES directive found.")
+                if stream_callback:
+                    stream_callback({
+                        "event_type": "joiner_decision_replan_yes",
+                        "message": "Joiner decided that replanning is needed",
+                        "reasoning": response_for_user_or_explanation[:200] + "..." if len(response_for_user_or_explanation) > 200 else response_for_user_or_explanation
+                    })
             elif first_line_upper == "REPLAN: NO":
                 initial_needs_replanning = False
                 response_for_user_or_explanation = "\n".join(content_lines[1:]).strip()
                 self.logger.info("Joiner: REPLAN: NO directive found.")
+                if stream_callback:
+                    stream_callback({
+                        "event_type": "joiner_decision_replan_no",
+                        "message": "Joiner decided that replanning is NOT needed",
+                        "response_preview": response_for_user_or_explanation[:200] + "..." if len(response_for_user_or_explanation) > 200 else response_for_user_or_explanation
+                    })
             else:
                 self.logger.warning(f"Joiner: REPLAN directive missing or malformed in LLM output for planned query. First line: '{content_lines[0][:100]}'. Defaulting to replan.")
+                if stream_callback:
+                    stream_callback({
+                        "event_type": "joiner_parsing_error",
+                        "message": "REPLAN directive missing or malformed, defaulting to replanning",
+                        "issue": f"First line was: '{content_lines[0][:100]}'"
+                    })
                 initial_needs_replanning = True
                 response_for_user_or_explanation = f"LLM output format error (REPLAN directive missing/malformed). Original output (first 200 chars): '{content.strip()[:200]}...'. Replanning is recommended."
         
@@ -520,9 +598,22 @@ class Joiner:
                 if end_index == -1: end_index = len(response_for_user_or_explanation)
                 extracted_block = response_for_user_or_explanation[start_index:end_index].strip()
                 self.logger.info(f"Joiner: Extracted USER_RESPONSE block. Length: {len(extracted_block)}")
+                if stream_callback:
+                    stream_callback({
+                        "event_type": "joiner_user_response_extracted",
+                        "message": "Joiner extracted final user response from analysis",
+                        "response_length": len(extracted_block),
+                        "user_response": extracted_block
+                    })
             except Exception as e_parse_user:
                 self.logger.warning(f"Joiner: Error parsing USER_RESPONSE block: {e_parse_user}. Using full response after REPLAN directive.")
                 extracted_block = response_for_user_or_explanation
+                if stream_callback:
+                    stream_callback({
+                        "event_type": "joiner_parsing_error",
+                        "message": f"Error parsing USER_RESPONSE block: {e_parse_user}",
+                        "fallback_action": "Using full response content"
+                    })
         elif "EXPLANATION_START" in response_for_user_or_explanation:
             try:
                 start_marker = "EXPLANATION_START"
@@ -533,16 +624,46 @@ class Joiner:
                 extracted_block = response_for_user_or_explanation[start_index:end_index].strip()
                 self.logger.info(f"Joiner: Extracted EXPLANATION block. Length: {len(extracted_block)}")
                 self.logger.debug(f"Joiner: Explanation for replan: {extracted_block}")
+                if stream_callback:
+                    stream_callback({
+                        "event_type": "joiner_explanation_extracted",
+                        "message": "Joiner extracted explanation for its decision",
+                        "explanation_length": len(extracted_block),
+                        "explanation": extracted_block
+                    })
             except Exception as e_parse_exp:
                 self.logger.warning(f"Joiner: Error parsing EXPLANATION block: {e_parse_exp}. Using full response after REPLAN directive.")
                 extracted_block = response_for_user_or_explanation
+                if stream_callback:
+                    stream_callback({
+                        "event_type": "joiner_parsing_error",
+                        "message": f"Error parsing EXPLANATION block: {e_parse_exp}",
+                        "fallback_action": "Using full response content"
+                    })
         else:
             self.logger.warning("Joiner: Neither USER_RESPONSE nor EXPLANATION markers found in planned query response. Using content after REPLAN directive as is.")
             extracted_block = response_for_user_or_explanation
+            if stream_callback:
+                stream_callback({
+                    "event_type": "joiner_parsing_warning",
+                    "message": "No USER_RESPONSE or EXPLANATION markers found in response",
+                    "fallback_action": "Using raw content after REPLAN directive"
+                })
 
         self.logger.info(f"Joiner: Replanning determined as {'needed' if initial_needs_replanning else 'not needed'} for planned query.")
         final_user_response = extracted_block if extracted_block else response_for_user_or_explanation
         final_explanation = response_for_user_or_explanation if initial_needs_replanning else None
+
+        # Stream the final decision and reasoning
+        if stream_callback:
+            stream_callback({
+                "event_type": "joiner_final_decision",
+                "needs_replanning": initial_needs_replanning,
+                "decision_reason": "Joiner completed analysis and made final decision",
+                "final_response": final_user_response if not initial_needs_replanning else None,
+                "explanation": final_explanation if initial_needs_replanning else None,
+                "response_type": "USER_RESPONSE" if "USER_RESPONSE_START" in response_for_user_or_explanation else ("EXPLANATION" if "EXPLANATION_START" in response_for_user_or_explanation else "RAW_CONTENT")
+            })
 
         return {
             "needs_replanning": initial_needs_replanning,

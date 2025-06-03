@@ -150,6 +150,8 @@ class AgentState(BaseModel):
     
     logger: Optional[Any] = Field(default=None, exclude=True, description="Instance of MochiLogger for logging within graph execution. Excluded from serialization.") # ADDED LOGGER FIELD HERE
 
+    stream_callback: Optional[Any] = Field(default=None, exclude=True, description="Optional callback function for streaming events during execution. Excluded from serialization.") # ADDED STREAM_CALLBACK FIELD
+
     replan_context: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Contextual information for replanning, such as previous errors or partial results.") # ADDED FIELD
 
     dag_repair_error: Optional[str] = Field(None, description="Error message specifically from a DAG repair attempt, if any.") # ADDED FIELD

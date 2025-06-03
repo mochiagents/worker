@@ -410,6 +410,10 @@ Avoid technical jargon. Be polite and helpful.
         """Executes the LangGraph application loop for a given agent state (single DAG processing)."""
         current_iteration_state_dict = agent_state_dict.copy() 
         
+        # Add stream_callback to the state dict so nodes can access it
+        # This field is excluded from serialization in AgentState, so it's safe to add here
+        current_iteration_state_dict['stream_callback'] = stream_callback
+        
         # max_dag_replanning_cycles refers to how many times we can replan for *this specific DAG*
         max_dag_replanning_cycles = self.config.agent_settings.max_replanning_cycles 
         

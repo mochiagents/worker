@@ -432,7 +432,8 @@ async def joiner_node(state: AgentState) -> AgentState:
             task_status=task_statuses,
             planner_output=planner_output,
             conversation_context=conversation_context,
-            mcp_clients=mcp_clients
+            mcp_clients=mcp_clients,
+            stream_callback=state.stream_callback
         )
         
         log_message = f"Joiner node: joiner_instance.process_results call COMPLETED. Needs Replan: {joiner_result.get('needs_replanning')}"
