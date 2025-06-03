@@ -27,7 +27,11 @@ REPLAN: [YES/NO]
 If REPLAN: NO:
   If the request is well-addressed and a final answer can be provided to the user:
     USER_RESPONSE_START
-    <The comprehensive and coherent final response for the user, synthesizing all relevant information from the task results. DO NOT include your internal analysis or reasons for not replanning here.>
+    <Extract and synthesize the actual information from the task results to create a comprehensive, natural language answer to the user's original question. Do NOT write meta-commentary about task completion - instead, present the actual findings, data, or information that answers what the user asked for. For example:
+    - If they asked about AI developments, list the actual developments found
+    - If they asked for data analysis, present the actual insights and conclusions
+    - If they asked for recommendations, provide the actual recommendations
+    - Always write as if speaking directly to the user about their question>
     USER_RESPONSE_END
   If the request cannot be fully fulfilled with the current information, OR if you have determined that further replanning is unproductive (e.g., tools are insufficient, information is unavailable, or previous replans have not improved the situation), but you can provide a partial answer or an explanation of limitations:
     EXPLANATION_START
@@ -45,6 +49,53 @@ Important Rules:
 - If REPLAN: YES, you MUST provide an EXPLANATION_START...END block.
 - Do NOT output both USER_RESPONSE and EXPLANATION blocks in the same response.
 - Your internal analysis should NOT be part of the USER_RESPONSE or EXPLANATION blocks.
+- CRITICAL: The USER_RESPONSE block should contain the actual answer to the user's question based on synthesizing the task results, NOT commentary about whether tasks succeeded or failed.
+'''
+
+# Additional guidance for synthesizing task results
+TASK_RESULT_SYNTHESIS_GUIDANCE = '''
+GUIDANCE FOR SYNTHESIZING TASK RESULTS INTO USER RESPONSES:
+
+When creating the USER_RESPONSE block, follow these steps:
+1. EXTRACT: Look at each completed task's result and extract the relevant information
+2. FILTER: Identify which information directly addresses the user's question
+3. ORGANIZE: Structure the information logically (chronologically, by importance, by category, etc.)
+4. SYNTHESIZE: Combine the information into a coherent, natural response
+5. FORMAT: Present it as if you're directly answering the user
+
+Examples of GOOD USER_RESPONSE blocks:
+
+For "What are the latest AI developments?":
+USER_RESPONSE_START
+Based on recent research, here are the key AI developments:
+
+1. **Large Language Models**: GPT-4 Turbo was released with improved reasoning capabilities and reduced hallucinations.
+2. **Multimodal AI**: Claude 3 introduced enhanced image understanding and document analysis features.
+3. **Code Generation**: GitHub Copilot Chat launched with conversational code assistance.
+
+These developments show a trend toward more capable, multimodal AI systems with better reasoning abilities.
+USER_RESPONSE_END
+
+For "Analyze our Q3 sales data":
+USER_RESPONSE_START
+Here's the analysis of your Q3 sales data:
+
+**Overall Performance**: Sales increased 15% compared to Q2, reaching $2.3M total revenue.
+
+**Top Performers**: 
+- Product A: $850K (37% of total)
+- Product B: $690K (30% of total)
+- Product C: $460K (20% of total)
+
+**Key Insights**: The growth was driven primarily by Product A, which saw a 25% increase due to the new marketing campaign launched in August.
+
+**Recommendations**: Focus marketing efforts on Product C to boost its performance, as it has similar market potential to Product A.
+USER_RESPONSE_END
+
+Examples of BAD USER_RESPONSE blocks (avoid these):
+- "The search task completed successfully and found relevant information."
+- "All tasks executed properly and the results appear to address your query."
+- "The analysis has been completed and the data has been processed."
 '''
 
 DAG_REPAIR_SYSTEM_PROMPT_TEMPLATE = '''You are an expert AI DAG repair assistant.
@@ -243,11 +294,15 @@ class JoinerPromptBuilder:
             results_str=results_str,
             custom_format_instructions_section=instructions_section
             )
+        
+        # Add synthesis guidance to help with proper response generation
+        full_prompt_str = formatted_prompt_str + "\n\n" + TASK_RESULT_SYNTHESIS_GUIDANCE
+        
         # Convert the formatted string back to a ChatPromptTemplate structure if needed by the LLM
         # For now, assuming the string format is sufficient downstream, but langchain often prefers structured prompts.
         # This part might need adjustment based on how the LLM is invoked.
         # Simple approach: return a ChatPromptTemplate with a single system message
-        return ChatPromptTemplate.from_messages([SystemMessagePromptTemplate.from_template(formatted_prompt_str)])
+        return ChatPromptTemplate.from_messages([SystemMessagePromptTemplate.from_template(full_prompt_str)])
 
     def get_joining_prompt_string(self, query: str, results_str: str, current_date: str, custom_format_instructions: Optional[str] = None) -> str:
         """
@@ -273,7 +328,11 @@ class JoinerPromptBuilder:
             results_str=results_str,
             custom_format_instructions_section=instructions_section
             )
-        return formatted_prompt
+        
+        # Add synthesis guidance to help with proper response generation
+        full_prompt = formatted_prompt + "\n\n" + TASK_RESULT_SYNTHESIS_GUIDANCE
+        
+        return full_prompt
 
     def get_dag_repair_prompt_string(
         self,
