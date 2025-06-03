@@ -7,7 +7,7 @@ name = "mochi-worker-agent"
 version = "0.0.1"
 description = "Mochi Worker Agent"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.13"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -32,7 +32,8 @@ dependencies = [
     "pytest",
     "pytest-asyncio",
     "sentence-transformers",
-    "torch"
+    "torch",
+    "psutil"
 ]
 
 [tool.setuptools.packages.find]
