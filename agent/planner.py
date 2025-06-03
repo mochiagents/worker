@@ -1,9 +1,10 @@
 import json
 from typing import List, Dict, Optional, Any, Set, Union, Tuple
-import logging
 import re
 import asyncio
 import os
+import time
+import hashlib
 from langchain_core.language_models.base import BaseLanguageModel
 from langchain_core.exceptions import OutputParserException
 import torch
@@ -19,7 +20,89 @@ from ..config import get_settings
 from worker.core.logging import MochiLogger
 from ..config.models import DEFAULT_SEMANTIC_STOP_WORDS, PlannerSettings
 
-logger = logging.getLogger(__name__)
+class ToolSchemaCache:
+    """Cache for tool schemas with TTL and validation."""
+    
+    def __init__(self, ttl_seconds: int = 3600, max_size: int = 100):  # 1 hour TTL
+        self.cache: Dict[str, Dict[str, Any]] = {}
+        self.ttl_seconds = ttl_seconds
+        self.max_size = max_size
+        self.access_times: Dict[str, float] = {}
+        self.schema_hashes: Dict[str, str] = {}  # For validation
+    
+    def _generate_cache_key(self, server_id: str, server_address: str) -> str:
+        """Generate a unique cache key for a server."""
+        return f"{server_id}:{hashlib.md5(server_address.encode()).hexdigest()[:8]}"
+    
+    def _is_expired(self, cache_key: str) -> bool:
+        """Check if a cache entry is expired."""
+        if cache_key not in self.access_times:
+            return True
+        return time.time() - self.access_times[cache_key] > self.ttl_seconds
+    
+    def _evict_oldest(self):
+        """Evict the oldest cache entry when max size is reached."""
+        if not self.access_times:
+            return
+        
+        oldest_key = min(self.access_times.keys(), key=lambda k: self.access_times[k])
+        self.cache.pop(oldest_key, None)
+        self.access_times.pop(oldest_key, None)
+        self.schema_hashes.pop(oldest_key, None)
+    
+    def get(self, server_id: str, server_address: str) -> Optional[List[Dict[str, Any]]]:
+        """Get cached tool schemas for a server."""
+        cache_key = self._generate_cache_key(server_id, server_address)
+        
+        if cache_key not in self.cache or self._is_expired(cache_key):
+            return None
+        
+        # Update access time
+        self.access_times[cache_key] = time.time()
+        return self.cache[cache_key]
+    
+    def set(self, server_id: str, server_address: str, schemas: List[Dict[str, Any]]):
+        """Cache tool schemas for a server."""
+        cache_key = self._generate_cache_key(server_id, server_address)
+        
+        # Ensure we don't exceed max size
+        if len(self.cache) >= self.max_size and cache_key not in self.cache:
+            self._evict_oldest()
+        
+        # Store schemas and metadata
+        self.cache[cache_key] = schemas
+        self.access_times[cache_key] = time.time()
+        
+        # Generate hash for validation
+        schema_str = json.dumps(schemas, sort_keys=True)
+        self.schema_hashes[cache_key] = hashlib.md5(schema_str.encode()).hexdigest()
+    
+    def invalidate(self, server_id: str, server_address: str):
+        """Invalidate cached schemas for a specific server."""
+        cache_key = self._generate_cache_key(server_id, server_address)
+        self.cache.pop(cache_key, None)
+        self.access_times.pop(cache_key, None)
+        self.schema_hashes.pop(cache_key, None)
+    
+    def clear(self):
+        """Clear all cached schemas."""
+        self.cache.clear()
+        self.access_times.clear()
+        self.schema_hashes.clear()
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        total_entries = len(self.cache)
+        expired_count = sum(1 for key in self.cache.keys() if self._is_expired(key))
+        
+        return {
+            "total_entries": total_entries,
+            "active_entries": total_entries - expired_count,
+            "expired_entries": expired_count,
+            "cache_keys": list(self.cache.keys()),
+            "oldest_access": min(self.access_times.values()) if self.access_times else None,
+            "newest_access": max(self.access_times.values()) if self.access_times else None
+        }
 
 class Planner:
     '''Planner module to generate task DAGs from user queries.'''
@@ -33,7 +116,8 @@ class Planner:
         logger_instance: Optional[MochiLogger] = None,
     ):
         '''Initializes the Planner.'''
-        self.logger: Union[MochiLogger, logging.Logger] = logger_instance if logger_instance else logging.getLogger(f"mochi.{self.__class__.__name__}")
+        from worker.config import get_settings
+        self.logger: Union[MochiLogger] = logger_instance if logger_instance else MochiLogger(config=get_settings().logging)
 
         if not isinstance(llm, BaseLanguageModel):
             raise TypeError('llm must be an instance of BaseLanguageModel')
@@ -51,6 +135,14 @@ class Planner:
         self.prompt_builder = prompt_builder or PlannerPromptBuilder()
         self.settings = settings
         self.stop_words: Set[str] = set(self.settings.semantic_stop_words) if self.settings.semantic_stop_words else DEFAULT_SEMANTIC_STOP_WORDS
+        
+        # Initialize tool schema cache
+        cache_ttl = getattr(settings, 'schema_cache_ttl_seconds', 3600)  # Default 1 hour
+        cache_size = getattr(settings, 'schema_cache_max_size', 100)    # Default 100 entries
+        self.schema_cache = ToolSchemaCache(ttl_seconds=cache_ttl, max_size=cache_size)
+        
+        # Track last successful schema fetch per server for fallback
+        self.last_successful_schemas: Dict[str, List[Dict[str, Any]]] = {}
         
         # --- Initialize Embedding Model --- 
         self.embedding_model = None
@@ -201,15 +293,45 @@ class Planner:
         self.logger.debug(f"_get_schema_type_from_path: Could not determine type for schema {schema} at path {path_segments}. Final schema part: {current_schema}")
         return None
 
-    async def get_tool_schemas(self) -> List[ServerToolSchemaGroup]:
-        '''Retrieves and formats MCP Tool Server schemas as Pydantic models from all configured clients.'''
+    async def get_tool_schemas(self, use_cache: bool = True, force_refresh: bool = False) -> List[ServerToolSchemaGroup]:
+        '''Retrieves and formats MCP Tool Server schemas as Pydantic models from all configured clients.
+        
+        Args:
+            use_cache: Whether to use cached schemas if available
+            force_refresh: Force refresh all schemas, bypassing cache
+        '''
         all_raw_tool_defs: List[Dict[str, Any]] = []
+        cache_hits = 0
+        cache_misses = 0
         
         if not self.mcp_clients:
             self.logger.info("No MCP clients configured in Planner. Cannot fetch tool schemas.")
             return []
 
+        # Clear cache if force refresh is requested
+        if force_refresh:
+            self.schema_cache.clear()
+            self.logger.info("Schema cache cleared due to force_refresh=True")
+
         for server_id_key, client in self.mcp_clients.items():
+            server_schemas = None
+            
+            # Try cache first if enabled and not forcing refresh
+            if use_cache and not force_refresh:
+                server_schemas = self.schema_cache.get(server_id_key, client.server_address)
+                if server_schemas:
+                    cache_hits += 1
+                    self.logger.debug(f"Using cached schemas for server {server_id_key}")
+                    
+                    # Add server_id to each tool if missing and add to results
+                    for tool_def in server_schemas:
+                        if 'server_id' not in tool_def:
+                            tool_def['server_id'] = server_id_key
+                    all_raw_tool_defs.extend(server_schemas)
+                    continue
+            
+            # Cache miss or cache disabled - fetch from server
+            cache_misses += 1
             try:
                 if not client._is_initialized:
                     self.logger.warning(f'McpClient for server {server_id_key} not initialized. Attempting to initialize.')
@@ -219,29 +341,77 @@ class Planner:
                         self.logger.warning(f"McpClient for server {server_id_key} does not have an async initialize method or it's not callable.", event_type="MCP_CLIENT_WARN")
 
                 self.logger.info(f"Fetching tools from MCP server: {server_id_key} via client: {client.server_address}")
-                tools_from_server = await client.list_tools()
+                
+                # Use enhanced retry logic for schema fetching
+                @client.circuit_breaker.call
+                async def _fetch_schemas():
+                    return await client.list_tools()
+                
+                tools_from_server = await client._retry_with_backoff(
+                    _fetch_schemas,
+                    f"fetch_schemas[{server_id_key}]",
+                    timeout=client.schema_fetch_timeout
+                )
+                
+                # Process and validate fetched schemas
+                processed_schemas = []
                 for tool_def in tools_from_server:
+                    # Ensure tool has server_id
                     if 'server_id' not in tool_def:
                         self.logger.debug(f"Tool definition from {server_id_key} missing 'server_id', adding it. Tool: {tool_def.get('tool_name', 'Unknown')}")
                         tool_def['server_id'] = server_id_key
                     elif tool_def['server_id'] != server_id_key:
                         self.logger.warning(f"Mismatched server_id in tool definition from {server_id_key}. Expected {server_id_key}, got {tool_def['server_id']}. Using expected: {server_id_key}", event_type="MCP_DATA_MISMATCH")
                         tool_def['server_id'] = server_id_key
-
-                all_raw_tool_defs.extend(tools_from_server)
+                    
+                    processed_schemas.append(tool_def)
+                
+                # Cache the successfully fetched schemas
+                if use_cache and processed_schemas:
+                    self.schema_cache.set(server_id_key, client.server_address, processed_schemas)
+                    self.last_successful_schemas[server_id_key] = processed_schemas.copy()
+                    self.logger.debug(f"Cached {len(processed_schemas)} schemas for server {server_id_key}")
+                
+                all_raw_tool_defs.extend(processed_schemas)
                 
             except McpError as e:
                 self.logger.error(f'MCPError while fetching tool schemas from server {server_id_key} ({client.server_address}): {e}', exc_info=True)
+                
+                # Try to use fallback from last successful fetch
+                if use_cache and server_id_key in self.last_successful_schemas:
+                    fallback_schemas = self.last_successful_schemas[server_id_key]
+                    self.logger.warning(f"Using fallback schemas for server {server_id_key} (last successful fetch with {len(fallback_schemas)} tools)")
+                    all_raw_tool_defs.extend(fallback_schemas)
+                else:
+                    self.logger.warning(f"No fallback schemas available for server {server_id_key}")
                 continue 
+                
             except Exception as e:
                 self.logger.error(f'Unexpected error fetching tool schemas from server {server_id_key} ({client.server_address}): {e}', exc_info=True)
+                
+                # Try to use fallback from last successful fetch
+                if use_cache and server_id_key in self.last_successful_schemas:
+                    fallback_schemas = self.last_successful_schemas[server_id_key]
+                    self.logger.warning(f"Using fallback schemas for server {server_id_key} due to unexpected error (last successful fetch with {len(fallback_schemas)} tools)")
+                    all_raw_tool_defs.extend(fallback_schemas)
+                else:
+                    self.logger.warning(f"No fallback schemas available for server {server_id_key}")
                 continue
+        
+        # Log cache performance
+        total_servers = len(self.mcp_clients)
+        if total_servers > 0:
+            cache_hit_rate = (cache_hits / total_servers) * 100
+            self.logger.info(f"Schema fetch completed. Cache hits: {cache_hits}, Cache misses: {cache_misses}, Hit rate: {cache_hit_rate:.1f}%")
         
         if not all_raw_tool_defs:
             self.logger.warning("No tool definitions could be fetched from any MCP client.", event_type="PLANNER_TOOLS_EMPTY")
             return []
 
+        # Group schemas by server
         grouped_schemas_dict: Dict[str, ServerToolSchemaGroup] = {}
+        validation_errors = []
+        
         for tool_def in all_raw_tool_defs:
             server_id = tool_def.get('server_id')
             if not server_id:
@@ -251,6 +421,7 @@ class Planner:
             try:
                 tool_instance = ToolSchema.model_validate(tool_def)
             except ValidationError as ve:
+                validation_errors.append(f"Tool {tool_def.get('tool_name')} on server {server_id}: {ve}")
                 self.logger.warning(f"Pydantic validation error for tool {tool_def.get('tool_name')} on server {server_id}: {ve}")
                 continue
 
@@ -264,7 +435,34 @@ class Planner:
             
             grouped_schemas_dict[server_id].tools.append(tool_instance)
         
-        return list(grouped_schemas_dict.values())
+        # Log validation errors summary
+        if validation_errors:
+            self.logger.warning(f"Schema validation errors encountered: {len(validation_errors)} tools failed validation")
+            for error in validation_errors[:5]:  # Log first 5 errors
+                self.logger.warning(f"Validation error: {error}")
+            if len(validation_errors) > 5:
+                self.logger.warning(f"... and {len(validation_errors) - 5} more validation errors")
+        
+        result_schemas = list(grouped_schemas_dict.values())
+        total_tools = sum(len(group.tools) for group in result_schemas)
+        self.logger.info(f"Successfully processed {total_tools} tools across {len(result_schemas)} servers")
+        
+        return result_schemas
+
+    def get_schema_cache_stats(self) -> Dict[str, Any]:
+        """Get statistics about the schema cache."""
+        return self.schema_cache.get_stats()
+    
+    def invalidate_schema_cache(self, server_id: Optional[str] = None):
+        """Invalidate schema cache for a specific server or all servers."""
+        if server_id and server_id in self.mcp_clients:
+            client = self.mcp_clients[server_id]
+            self.schema_cache.invalidate(server_id, client.server_address)
+            self.logger.info(f"Invalidated schema cache for server: {server_id}")
+        else:
+            self.schema_cache.clear()
+            self.last_successful_schemas.clear()
+            self.logger.info("Invalidated all schema caches")
 
     def _recommend_tools(
         self,
@@ -650,30 +848,101 @@ class Planner:
 
         visited_during_dfs: Set[str] = set()
         recursion_stack: Set[str] = set()
-
-        def detect_cycle_util(node_id: str) -> bool:
+        parent_map: Dict[str, Optional[str]] = {}  # Track parent for cycle path reconstruction
+        
+        def detect_cycle_util(node_id: str, parent: Optional[str] = None) -> Optional[List[str]]:
+            """
+            DFS-based cycle detection with path tracking.
+            Returns the cycle path if found, None otherwise.
+            """
             visited_during_dfs.add(node_id)
             recursion_stack.add(node_id)
+            parent_map[node_id] = parent
 
             for neighbor_id in adj.get(node_id, []): 
                 if neighbor_id not in visited_during_dfs:
-                    if detect_cycle_util(neighbor_id):
-                        return True
+                    cycle_path = detect_cycle_util(neighbor_id, node_id)
+                    if cycle_path:
+                        return cycle_path
                 elif neighbor_id in recursion_stack:
-                    self.logger.error(f"Cycle detected involving node {neighbor_id} (part of recursion stack: {recursion_stack})")
-                    # To provide a more helpful error, one might try to reconstruct the cycle path here.
-                    # For now, this message and raising ValueError is the primary goal.
-                    return True
+                    # Found a back edge - reconstruct the cycle path
+                    cycle_path = []
+                    current = node_id
+                    
+                    # Build the path from current node back to the cycle start
+                    while current is not None and current != neighbor_id:
+                        cycle_path.append(current)
+                        current = parent_map.get(current)
+                    
+                    # Add the cycle start node to complete the cycle
+                    if current == neighbor_id:
+                        cycle_path.append(neighbor_id)
+                        cycle_path.reverse()  # Reverse to show actual dependency flow
+                    
+                    self.logger.error(
+                        f"Cycle detected in DAG: {' -> '.join(cycle_path)} -> {cycle_path[0]}. "
+                        f"This creates a circular dependency where tasks depend on each other directly or indirectly."
+                    )
+                    return cycle_path
             
             recursion_stack.remove(node_id)
-            return False
+            return None
 
+        # Check for cycles starting from each unvisited node
         for task_id_str_val in task_ids_in_current_dag:
             if task_id_str_val not in visited_during_dfs:
-                if detect_cycle_util(task_id_str_val):
-                    # More detailed cycle path reconstruction could be added here.
-                    raise ValueError("Cyclic dependency detected in the task DAG. Please review task dependencies.")
+                cycle_path = detect_cycle_util(task_id_str_val)
+                if cycle_path:
+                    # Provide detailed error with cycle information
+                    cycle_description = " -> ".join(cycle_path) + f" -> {cycle_path[0]}"
+                    task_details = []
+                    
+                    for task_id in cycle_path:
+                        task_node = task_id_to_node_map.get(task_id)
+                        if task_node:
+                            task_details.append(
+                                f"  • {task_id} (tool: {task_node.server_id or 'special'}/{task_node.tool_name})"
+                            )
+                    
+                    error_msg = (
+                        f"Cyclic dependency detected in the task DAG. The cycle involves the following tasks:\n"
+                        f"Cycle path: {cycle_description}\n"
+                        f"\nTasks in cycle:\n" + "\n".join(task_details) + "\n\n"
+                        f"Please review the dependencies to ensure no task depends on itself directly or indirectly. "
+                        f"Consider breaking the cycle by removing unnecessary dependencies or restructuring the workflow."
+                    )
+                    raise ValueError(error_msg)
         
+        # Additional validation: Check for self-dependencies
+        self_dependent_tasks = []
+        for task_node in dag.tasks:
+            if task_node.id in task_node.dependencies:
+                self_dependent_tasks.append(task_node.id)
+        
+        if self_dependent_tasks:
+            error_msg = (
+                f"Self-dependency detected: The following tasks depend on themselves: {', '.join(self_dependent_tasks)}. "
+                f"A task cannot depend on itself - please remove these self-references."
+            )
+            raise ValueError(error_msg)
+        
+        # Additional validation: Check for orphaned dependencies
+        orphaned_deps = []
+        for task_node in dag.tasks:
+            for dep_id in task_node.dependencies:
+                if dep_id not in task_ids_in_current_dag:
+                    orphaned_deps.append((task_node.id, dep_id))
+        
+        if orphaned_deps:
+            orphaned_details = [f"  • Task '{task_id}' depends on non-existent task '{dep_id}'" 
+                              for task_id, dep_id in orphaned_deps]
+            error_msg = (
+                f"Orphaned dependencies detected in the DAG:\n" + "\n".join(orphaned_details) + "\n\n"
+                f"All dependencies must reference valid task IDs within the same DAG. "
+                f"Please check for typos in dependency task IDs or ensure all referenced tasks are included."
+            )
+            raise ValueError(error_msg)
+
         self.logger.info("DAG logical validation, including $result reference schema checks, passed successfully.")
 
     def _validate_search_extract_use_pattern(self, dag: TaskDAG, task_id_to_node_map: Dict[str, TaskNode]) -> None:

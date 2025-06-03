@@ -12,6 +12,8 @@ from httpx import AsyncClient, Timeout, HTTPStatusError, RequestError, ConnectTi
 import httpx
 from ..core.models import StructuredError
 from ..config import get_settings
+import time
+import random
 
 class McpError(Exception):
     """Base exception for MCP client errors."""
@@ -29,6 +31,53 @@ class McpNotInitializedError(McpError):
     """Raised when an operation is attempted before the client is initialized."""
     pass
 
+class McpCircuitBreakerError(McpError):
+    """Raised when circuit breaker is open."""
+    pass
+
+class CircuitBreaker:
+    """Simple circuit breaker implementation for MCP connections."""
+    
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        
+    def call(self, func):
+        """Decorator to wrap MCP calls with circuit breaker logic."""
+        async def wrapper(*args, **kwargs):
+            if self.state == "OPEN":
+                if time.time() - self.last_failure_time > self.recovery_timeout:
+                    self.state = "HALF_OPEN"
+                else:
+                    raise McpCircuitBreakerError(f"Circuit breaker is OPEN. Will retry after {self.recovery_timeout}s")
+            
+            try:
+                result = await func(*args, **kwargs)
+                if self.state == "HALF_OPEN":
+                    self.reset()
+                return result
+            except (McpTimeoutError, McpConnectionError) as e:
+                self.record_failure()
+                raise e
+                
+        return wrapper
+    
+    def record_failure(self):
+        """Record a failure and potentially open the circuit."""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        
+        if self.failure_count >= self.failure_threshold:
+            self.state = "OPEN"
+            
+    def reset(self):
+        """Reset the circuit breaker to closed state."""
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = "CLOSED"
 
 class McpClient:
     """
@@ -67,11 +116,17 @@ class McpClient:
         self.logger = logger_instance or MochiLogger(config=get_settings().logging)
         self.settings = get_settings()
         
+        # Enhanced timeout configuration
         self.request_timeout = self.settings.mcp_client_defaults.default_request_timeout_seconds
         self.connect_timeout = self.settings.mcp_client_defaults.default_connect_timeout_seconds
         self.sse_heartbeat_timeout = self.settings.mcp_client_defaults.sse_heartbeat_timeout_seconds
         self.sse_max_retries = self.settings.mcp_client_defaults.sse_max_retries
         self.sse_retry_delay = self.settings.mcp_client_defaults.sse_retry_delay_seconds
+        
+        # Operation-specific timeouts
+        self.tool_call_timeout = self.request_timeout * 2  # Tool calls might take longer
+        self.schema_fetch_timeout = self.request_timeout // 2  # Schema fetches should be fast
+        self.list_operations_timeout = self.request_timeout  # Standard timeout for list operations
         
         self.server_name = server_name
         self.server_address = server_address.rstrip("/")
@@ -81,6 +136,15 @@ class McpClient:
         self.tool_schemas: List[Dict[str, Any]] = []
         self.openapi_spec: Optional[Dict[str, Any]] = None
         self.server_description: Optional[str] = None
+
+        # Circuit breaker for reliability
+        self.circuit_breaker = CircuitBreaker(failure_threshold=3, recovery_timeout=30.0)
+        
+        # Retry configuration with exponential backoff
+        self.max_retries = 3
+        self.base_retry_delay = 1.0
+        self.max_retry_delay = 30.0
+        self.jitter_factor = 0.1
 
         if server_config_override:
             self.logger.info(f"Applying server-specific overrides for MCP client: {server_name}")
@@ -92,6 +156,10 @@ class McpClient:
             self.auth_token = server_config_override.auth_token
             self.custom_headers = server_config_override.custom_headers or {}
             self.mock_tool_schemas = server_config_override.mock_tool_schemas
+            
+            # Update operation-specific timeouts based on overrides
+            self.tool_call_timeout = self.request_timeout * 2
+            self.schema_fetch_timeout = self.request_timeout // 2
         else:
             self.max_retries = self.settings.execution.max_retries
             self.retry_delay_seconds = self.settings.execution.initial_retry_delay_seconds
@@ -106,7 +174,7 @@ class McpClient:
         self._process: Optional[Any] = None
         self._manages_http_client: bool = False
         
-        self.logger.info(f"McpClient for '{self.server_name}' initialized. Address: {self.server_address}, Request Timeout: {self.request_timeout}, Connect Timeout: {self.connect_timeout}")
+        self.logger.info(f"McpClient for '{self.server_name}' initialized. Address: {self.server_address}, Request Timeout: {self.request_timeout}, Tool Call Timeout: {self.tool_call_timeout}, Connect Timeout: {self.connect_timeout}")
 
         if http_client_instance:
             self.http_client = http_client_instance
@@ -115,6 +183,62 @@ class McpClient:
             timeout_config = httpx.Timeout(self.request_timeout, connect=self.connect_timeout)
             self.http_client = AsyncClient(timeout=timeout_config)
             self._manages_http_client = True
+
+    def _calculate_retry_delay(self, attempt: int) -> float:
+        """Calculate exponential backoff delay with jitter."""
+        delay = min(self.base_retry_delay * (2 ** attempt), self.max_retry_delay)
+        jitter = delay * self.jitter_factor * random.random()
+        return delay + jitter
+
+    async def _retry_with_backoff(self, operation, operation_name: str, timeout: Optional[float] = None, *args, **kwargs):
+        """Execute an operation with exponential backoff retry logic."""
+        last_exception = None
+        effective_timeout = timeout or self.request_timeout
+        
+        for attempt in range(self.max_retries + 1):
+            try:
+                # Update timeout for httpx operations
+                if hasattr(self.http_client, 'timeout'):
+                    old_timeout = self.http_client.timeout
+                    self.http_client.timeout = httpx.Timeout(effective_timeout, connect=self.connect_timeout)
+                
+                result = await operation(*args, **kwargs)
+                
+                # Restore original timeout
+                if hasattr(self.http_client, 'timeout'):
+                    self.http_client.timeout = old_timeout
+                    
+                if attempt > 0:
+                    self.logger.info(f"Operation '{operation_name}' succeeded on attempt {attempt + 1}")
+                return result
+                
+            except (McpTimeoutError, McpConnectionError, asyncio.TimeoutError, ConnectTimeout, ReadTimeout) as e:
+                last_exception = e
+                
+                # Restore original timeout on error
+                if hasattr(self.http_client, 'timeout'):
+                    self.http_client.timeout = old_timeout
+                
+                if attempt < self.max_retries:
+                    delay = self._calculate_retry_delay(attempt)
+                    self.logger.warning(
+                        f"Operation '{operation_name}' failed on attempt {attempt + 1}/{self.max_retries + 1}: {type(e).__name__}: {e}. "
+                        f"Retrying in {delay:.2f}s..."
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    self.logger.error(
+                        f"Operation '{operation_name}' failed after {self.max_retries + 1} attempts. Last error: {type(e).__name__}: {e}"
+                    )
+                    
+            except Exception as e:
+                last_exception = e
+                # Don't retry non-timeout/connection errors
+                self.logger.error(f"Operation '{operation_name}' failed with non-retryable error: {type(e).__name__}: {e}")
+                break
+        
+        if last_exception:
+            raise last_exception
 
     async def initialize(self) -> None:
         """
@@ -554,19 +678,25 @@ class McpClient:
             McpError: For any MCP specific errors during the call, including tool execution errors.
             McpConnectionError: For network or transport issues.
             McpTimeoutError: If the request times out.
+            McpCircuitBreakerError: If the circuit breaker is open.
         """
         if not self._is_initialized:
             self.logger.error("Client not fully initialized for call_tool. Call initialize() first.")
-            # Raise McpNotInitializedError, which can be caught by the caller
-            # and translated into a StructuredError if appropriate there.
-            # For now, McpClient itself won't directly return ToolExecutionResult with StructuredError for this case.
             raise McpNotInitializedError("Client not fully initialized. Call initialize() first.")
 
         params = {"tool_id": tool_id, "inputs": inputs}
-        response_data: Optional[Dict[str, Any]] = None
-                
+        
         try:
-            response_data = await self.send_request_async("mcp_call_tool", params)
+            # Use circuit breaker and enhanced retry logic for tool calls
+            @self.circuit_breaker.call
+            async def _call_tool_operation():
+                return await self.send_request_async("mcp_call_tool", params)
+            
+            response_data = await self._retry_with_backoff(
+                _call_tool_operation,
+                f"call_tool[{tool_id}]",
+                timeout=self.tool_call_timeout
+            )
             
             if response_data and isinstance(response_data, dict) and "result" in response_data:
                 tool_output_payload = response_data["result"]
@@ -610,6 +740,15 @@ class McpClient:
                 )
                 return ToolExecutionResult(task_id=task_id_for_result, status="failure", output=None, error=structured_error)
 
+        except McpCircuitBreakerError as mcbe:
+            self.logger.error(f"Circuit breaker open for tool '{tool_id}': {mcbe}")
+            structured_error = StructuredError(
+                error_type="McpCircuitBreakerError", 
+                message=f"Circuit breaker open for tool {tool_id}: {str(mcbe)}",
+                is_retryable=False,  # Don't retry when circuit breaker is open
+                is_repairable=False
+            )
+            return ToolExecutionResult(task_id=task_id_for_result, status="failure", output=None, error=structured_error)
         except McpTimeoutError as mte:
             self.logger.error(f"McpTimeoutError during call_tool for tool '{tool_id}': {mte}", exc_info=True)
             structured_error = StructuredError(
@@ -653,7 +792,7 @@ class McpClient:
                 is_repairable=False # Usually client-side code issues, not DAG repairable
             )
             return ToolExecutionResult(task_id=task_id_for_result, status="failure", output=None, error=structured_error)
-        
+
     async def list_resources(self, resource_type: Optional[str] = None, resource_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
         Lists available resources or provides details for specified resource IDs.

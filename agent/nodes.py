@@ -1,17 +1,16 @@
 from typing import Dict, Any, List, Optional, Union
 from .state import AgentState
-import logging
 from worker.agent.planner import Planner
 from worker.agent.execution import TaskFetchingUnit
 from worker.core.models import TaskDAG, TaskNode, ToolExecutionResult
-from ..core.logging import MochiLogger
+from worker.core.logging import MochiLogger
 from worker.agent.mcp_client import McpError
 from worker.agent.dag_editor import DAGEditor
+from worker.config import get_settings
 import json
 
-logger = logging.getLogger(__name__)
-
-module_logger = logging.getLogger(__name__) 
+# Create module-level MochiLogger with proper config
+module_logger = MochiLogger(config=get_settings().logging)
 
 NODE_DESCRIPTIONS = {
     "planner_node": "Analyzes the user query and generates a plan (DAG) of tasks.",
@@ -26,14 +25,11 @@ def initialize_state(state: AgentState) -> Dict[str, Any]:
     Initializes or resets the agent state for a new execution run or replanning.
     Preserves essential configuration, input fields, and pre-initialized service instances.
     """
-    active_logger: Union[MochiLogger, logging.Logger] = state.logger or module_logger
+    active_logger: MochiLogger = state.logger or module_logger
     if state.logger is None:
         module_logger.warning("Initialize_state: MochiLogger not found in input state. Using default module_logger for this node.")
 
-    if isinstance(active_logger, MochiLogger):
-        active_logger.info("--- Initializing State (Graph Entry) ---", event_type="GRAPH_STATE_INIT") 
-    else:
-        active_logger.info("[GRAPH_STATE_INIT] --- Initializing State (Graph Entry) ---")
+    active_logger.info("--- Initializing State (Graph Entry) ---", event_type="GRAPH_STATE_INIT")
 
     preserved_fields = {
         "original_query": state.original_query,
@@ -71,31 +67,19 @@ def initialize_state(state: AgentState) -> Dict[str, Any]:
     for key in ["planner_instance", "task_fetching_unit_instance", "joiner_instance", "logger", "config", "dag_editor_instance"]:
         if update_dict.get(key) is None:
             if key == "dag_editor_instance":
-                if isinstance(active_logger, MochiLogger):
-                    active_logger.info(f"Initialize_state: Optional component '{key}' is missing from initial state. This may be expected if DAG repair is not yet fully integrated.", event_type="GRAPH_STATE_INFO")
-                else:
-                    active_logger.info(f"[GRAPH_STATE_INFO] Initialize_state: Optional component '{key}' is missing from initial state.")
-            elif isinstance(active_logger, MochiLogger):
-                active_logger.warning(f"Initialize_state: Critical component '{key}' is missing from initial state.", event_type="GRAPH_STATE_WARN")
-            else:
-                active_logger.warning(f"[GRAPH_STATE_WARN] Initialize_state: Critical component '{key}' is missing from initial state.")
+                active_logger.info(f"Initialize_state: Optional component '{key}' is missing from initial state. This may be expected if DAG repair is not yet fully integrated.", event_type="GRAPH_STATE_INFO")
+            active_logger.warning(f"Initialize_state: Critical component '{key}' is missing from initial state.", event_type="GRAPH_STATE_WARN")
 
-    if isinstance(active_logger, MochiLogger):
-        active_logger.info("State initialization complete. Preserved/Reset fields combined.", event_type="GRAPH_STATE_INIT_COMPLETE")
-    else:
-        active_logger.info("[GRAPH_STATE_INIT_COMPLETE] State initialization complete. Preserved/Reset fields combined.")
+    active_logger.info("State initialization complete. Preserved/Reset fields combined.", event_type="GRAPH_STATE_INIT_COMPLETE")
     return update_dict
 
 async def planner_node(state: AgentState) -> Dict[str, Any]:
     """Node function representing the Planner module (LLM Call)."""
-    active_logger: Union[MochiLogger, logging.Logger] = state.logger or module_logger
+    active_logger: MochiLogger = state.logger or module_logger
     if state.logger is None:
         module_logger.warning("Planner_node: MochiLogger not found in input state. Using default module_logger.")
 
-    if isinstance(active_logger, MochiLogger):
-        active_logger.info("--- Planner Node: Executing ---", event_type="NODE_EXEC_START", metadata={"node_name": "planner_node"})
-    else:
-        active_logger.info("[NODE_EXEC_START] --- Planner Node: Executing --- (node_name=planner_node)")
+    active_logger.info("--- Planner Node: Executing ---", event_type="NODE_EXEC_START", metadata={"node_name": "planner_node"})
 
     planner_instance: Optional[Planner] = state.planner_instance
     original_query: Optional[str] = state.original_query
@@ -146,19 +130,13 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
 
     if not planner_instance:
         error_msg = "Planner instance not found in agent state."
-        if isinstance(active_logger, MochiLogger):
-            active_logger.error(error_msg, event_type="NODE_CONFIG_ERROR", metadata={"node_name": "planner_node"})
-        else:
-            active_logger.error(f"[NODE_CONFIG_ERROR] {error_msg} (node_name=planner_node)")
+        active_logger.error(error_msg, event_type="NODE_CONFIG_ERROR", metadata={"node_name": "planner_node"})
         final_return_value["planner_error"] = error_msg
         return final_return_value
 
     if not query_for_planner: # Check query_for_planner instead of original_query directly here
         error_msg = "Input query (original or phase description) not available for planner."
-        if isinstance(active_logger, MochiLogger):
-            active_logger.error(error_msg, event_type="NODE_INPUT_ERROR", metadata={"node_name": "planner_node"})
-        else:
-            active_logger.error(f"[NODE_INPUT_ERROR] {error_msg} (node_name=planner_node)")
+        active_logger.error(error_msg, event_type="NODE_INPUT_ERROR", metadata={"node_name": "planner_node"})
         final_return_value["planner_error"] = error_msg
         return final_return_value
 
@@ -169,10 +147,7 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
             context_prefix = f"Original user query (overall goal): {original_query}\n\nCurrently working on phase '{current_phase_id}': {current_phase_description}\n\nPrior conversation:\n"
             effective_conversation_context = context_prefix + (conversation_context if conversation_context else "No prior conversation.")
 
-        if isinstance(active_logger, MochiLogger):
-            active_logger.info(f"Planner node: Calling planner_instance.generate_dag with query_for_planner: '{query_for_planner[:100]}...'", event_type="PLANNER_INVOKE", metadata={"node_name": "planner_node"})
-        else:
-            active_logger.info(f"[PLANNER_INVOKE] Planner node: Calling planner_instance.generate_dag with query_for_planner: '{query_for_planner[:100]}...' (node_name=planner_node)")
+        active_logger.info(f"Planner node: Calling planner_instance.generate_dag with query_for_planner: '{query_for_planner[:100]}...'", event_type="PLANNER_INVOKE", metadata={"node_name": "planner_node"})
 
         generated_dag_model, dag_generation_status_msg = await planner_instance.generate_dag(
             query=query_for_planner, # Use the determined query for planner
@@ -186,10 +161,7 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
         # dag_generation_status_msg is just a status from the generate_dag call.
         log_query_type_for_event = initial_classified_query_type if initial_classified_query_type else "Unknown_initial"
 
-        if isinstance(active_logger, MochiLogger):
-            active_logger.info(f"Planner node: planner_instance.generate_dag call COMPLETED. Status: {dag_generation_status_msg}, Initial Classified Type: {log_query_type_for_event}, DAG generated: {generated_dag_model is not None}", event_type="PLANNER_INVOKE_SUCCESS", metadata={"node_name": "planner_node", "status": dag_generation_status_msg, "initial_query_type": log_query_type_for_event})
-        else:
-            active_logger.info(f"[PLANNER_INVOKE_SUCCESS] Planner node: planner_instance.generate_dag call COMPLETED. Status: {dag_generation_status_msg}, Initial Classified Type: {log_query_type_for_event}, DAG generated: {generated_dag_model is not None} (node_name=planner_node)")
+        active_logger.info(f"Planner node: planner_instance.generate_dag call COMPLETED. Status: {dag_generation_status_msg}, Initial Classified Type: {log_query_type_for_event}, DAG generated: {generated_dag_model is not None}", event_type="PLANNER_INVOKE_SUCCESS", metadata={"node_name": "planner_node", "status": dag_generation_status_msg, "initial_query_type": log_query_type_for_event})
 
         final_return_value["task_dag"] = generated_dag_model
         final_return_value["planner_output"] = {"query_type": initial_classified_query_type, "status": dag_generation_status_msg, "error": None} 
@@ -198,26 +170,17 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
 
     except McpError as mcpe:
         error_msg = f"Planner node: McpError during DAG generation: {mcpe}"
-        if isinstance(active_logger, MochiLogger):
-            active_logger.error(error_msg, exc_info=True, event_type="PLANNER_MCP_ERROR", metadata={"node_name": "planner_node"})
-        else:
-            active_logger.error(f"[PLANNER_MCP_ERROR] {error_msg} (node_name=planner_node)", exc_info=True)
+        active_logger.error(error_msg, exc_info=True, event_type="PLANNER_MCP_ERROR", metadata={"node_name": "planner_node"})
         final_return_value["planner_error"] = str(mcpe)
         final_return_value["planner_output"] = {"query_type": initial_classified_query_type, "status": "Error: McpError", "error": str(mcpe)}
     except ValueError as ve:
         error_msg = f"Planner node: ValueError during DAG generation: {ve}"
-        if isinstance(active_logger, MochiLogger):
-            active_logger.error(error_msg, exc_info=True, event_type="PLANNER_VALIDATION_ERROR", metadata={"node_name": "planner_node"})
-        else:
-            active_logger.error(f"[PLANNER_VALIDATION_ERROR] {error_msg} (node_name=planner_node)", exc_info=True)
+        active_logger.error(error_msg, exc_info=True, event_type="PLANNER_VALIDATION_ERROR", metadata={"node_name": "planner_node"})
         final_return_value["planner_error"] = str(ve)
         final_return_value["planner_output"] = {"query_type": initial_classified_query_type, "status": "Error: ValueError", "error": str(ve)}
     except Exception as e_outer:
         error_msg = f"Planner node: Unexpected exception during DAG generation: {e_outer}"
-        if isinstance(active_logger, MochiLogger):
-            active_logger.error(error_msg, exc_info=True, event_type="PLANNER_UNEXPECTED_ERROR", metadata={"node_name": "planner_node"})
-        else:
-            active_logger.error(f"[PLANNER_UNEXPECTED_ERROR] {error_msg} (node_name=planner_node)", exc_info=True)
+        active_logger.error(error_msg, exc_info=True, event_type="PLANNER_UNEXPECTED_ERROR", metadata={"node_name": "planner_node"})
         final_return_value["planner_error"] = str(e_outer)
         final_return_value["planner_output"] = {"query_type": initial_classified_query_type, "status": "Error: Unexpected Exception", "error": str(e_outer)}
     
@@ -227,24 +190,18 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
     
     returned_query_type = final_return_value.get("planner_output", {}).get("query_type")
     
-    if isinstance(active_logger, MochiLogger):
-        active_logger.info(f"Planner node: Returning: query_type='{returned_query_type}', dag_tasks_count={dag_task_count}, error='{final_return_value['planner_error']}'", event_type="NODE_EXEC_COMPLETE", metadata={"node_name": "planner_node", "query_type": returned_query_type, "dag_task_count": dag_task_count, "error": final_return_value['planner_error']}) # type: ignore
-    else:
-        active_logger.info(f"[NODE_EXEC_COMPLETE] Planner node: Returning: query_type='{returned_query_type}', dag_tasks_count={dag_task_count}, error='{final_return_value['planner_error']}' (node_name=planner_node)")
+    active_logger.info(f"Planner node: Returning: query_type='{returned_query_type}', dag_tasks_count={dag_task_count}, error='{final_return_value['planner_error']}'", event_type="NODE_EXEC_COMPLETE", metadata={"node_name": "planner_node", "query_type": returned_query_type, "dag_task_count": dag_task_count, "error": final_return_value['planner_error']}) # type: ignore
     return final_return_value
 
 async def task_fetching_unit_node(state: AgentState) -> Dict[str, Any]:
     """Node responsible for managing DAG execution flow: identifying ready tasks, 
        delegating their execution, and updating overall DAG status.
     """
-    active_logger: Union[MochiLogger, logging.Logger] = state.logger or module_logger
+    active_logger: MochiLogger = state.logger or module_logger
     if state.logger is None:
         module_logger.warning("TaskFetchingUnit_node: MochiLogger not found in input state. Using default module_logger.")
 
-    if isinstance(active_logger, MochiLogger):
-        active_logger.info("--- Task Fetching Unit Node: Executing ---", event_type="NODE_EXEC_START", metadata={"node_name": "task_fetching_unit_node"})
-    else:
-        active_logger.info("[NODE_EXEC_START] --- Task Fetching Unit Node: Executing --- (node_name=task_fetching_unit_node)")
+    active_logger.info("--- Task Fetching Unit Node: Executing ---", event_type="NODE_EXEC_START", metadata={"node_name": "task_fetching_unit_node"})
 
     tfu_instance: Optional[TaskFetchingUnit] = state.task_fetching_unit_instance
     current_dag: Optional[TaskDAG] = state.task_dag
@@ -260,26 +217,17 @@ async def task_fetching_unit_node(state: AgentState) -> Dict[str, Any]:
 
     if not tfu_instance:
         error_msg = "TaskFetchingUnit instance not found in agent state."
-        if isinstance(active_logger, MochiLogger):
-            active_logger.error(error_msg, event_type="NODE_CONFIG_ERROR", metadata={"node_name": "task_fetching_unit_node"})
-        else:
-            active_logger.error(f"[NODE_CONFIG_ERROR] {error_msg} (node_name=task_fetching_unit_node)")
+        active_logger.error(error_msg, event_type="NODE_CONFIG_ERROR", metadata={"node_name": "task_fetching_unit_node"})
         return_update["execution_error"] = error_msg
         return return_update
 
     if not current_dag or not current_dag.tasks:
-        if isinstance(active_logger, MochiLogger):
-            active_logger.info("TaskFetchingUnit node: No DAG or no tasks in DAG. Nothing to process.", event_type="TFU_NO_DAG", metadata={"node_name": "task_fetching_unit_node"})
-        else:
-            active_logger.info("[TFU_NO_DAG] TaskFetchingUnit node: No DAG or no tasks in DAG. Nothing to process. (node_name=task_fetching_unit_node)")
+        active_logger.info("TaskFetchingUnit node: No DAG or no tasks in DAG. Nothing to process.", event_type="TFU_NO_DAG", metadata={"node_name": "task_fetching_unit_node"})
         return_update["all_completed"] = True # No tasks means all (zero) are technically completed
         return return_update
     
     try:
-        if isinstance(active_logger, MochiLogger):
-            active_logger.info("TaskFetchingUnit node: Calling tfu_instance.process_dag.", event_type="TFU_PROCESS_INVOKE", metadata={"node_name": "task_fetching_unit_node"})
-        else:
-            active_logger.info("[TFU_PROCESS_INVOKE] TaskFetchingUnit node: Calling tfu_instance.process_dag. (node_name=task_fetching_unit_node)")
+        active_logger.info("TaskFetchingUnit node: Calling tfu_instance.process_dag.", event_type="TFU_PROCESS_INVOKE", metadata={"node_name": "task_fetching_unit_node"})
         
         processed_state: AgentState = await tfu_instance.process_dag(current_dag, state)
 
@@ -292,41 +240,29 @@ async def task_fetching_unit_node(state: AgentState) -> Dict[str, Any]:
         # so we don't update it from processed_state unless TFU starts managing it.
         # If it was in the original state, it's preserved in return_update's initialization.
 
-        if isinstance(active_logger, MochiLogger):
-            active_logger.info("TaskFetchingUnit node: tfu_instance.process_dag call COMPLETED.", event_type="TFU_PROCESS_SUCCESS", metadata={"node_name": "task_fetching_unit_node"})
-        else:
-            active_logger.info("[TFU_PROCESS_SUCCESS] TaskFetchingUnit node: tfu_instance.process_dag call COMPLETED. (node_name=task_fetching_unit_node)")
+        active_logger.info("TaskFetchingUnit node: tfu_instance.process_dag call COMPLETED.", event_type="TFU_PROCESS_SUCCESS", metadata={"node_name": "task_fetching_unit_node"})
 
     except McpError as mcpe:
         error_msg = f"TaskFetchingUnit node: McpError during DAG processing: {mcpe}"
-        if isinstance(active_logger, MochiLogger):
-            active_logger.error(error_msg, exc_info=True, event_type="TFU_MCP_ERROR", metadata={"node_name": "task_fetching_unit_node"})
-        else:
-            active_logger.error(f"[TFU_MCP_ERROR] {error_msg} (node_name=task_fetching_unit_node)", exc_info=True)
+        active_logger.error(error_msg, exc_info=True, event_type="TFU_MCP_ERROR", metadata={"node_name": "task_fetching_unit_node"})
         return_update["execution_error"] = str(mcpe)
         return_update["all_completed"] = False
         return_update["has_ready_tasks"] = False
     except Exception as e_outer:
         error_msg = f"TaskFetchingUnit node: Unexpected exception during DAG processing: {e_outer}"
-        if isinstance(active_logger, MochiLogger):
-            active_logger.error(error_msg, exc_info=True, event_type="TFU_UNEXPECTED_ERROR", metadata={"node_name": "task_fetching_unit_node"})
-        else:
-            active_logger.error(f"[TFU_UNEXPECTED_ERROR] {error_msg} (node_name=task_fetching_unit_node)", exc_info=True)
+        active_logger.error(error_msg, exc_info=True, event_type="TFU_UNEXPECTED_ERROR", metadata={"node_name": "task_fetching_unit_node"})
         return_update["execution_error"] = str(e_outer)
         return_update["all_completed"] = False
         return_update["has_ready_tasks"] = False
 
-    if isinstance(active_logger, MochiLogger):
-        log_meta = {
-            "node_name": "task_fetching_unit_node",
-            "all_completed": return_update.get("all_completed"),
-            "has_ready_tasks": return_update.get("has_ready_tasks"),
-            "error": return_update.get("execution_error")
-        }
-        active_logger.info(f"TaskFetchingUnit node: Returning. All completed: {log_meta['all_completed']}, Has ready: {log_meta['has_ready_tasks']}, Error: '{log_meta['error']}'", \
-            event_type="NODE_EXEC_COMPLETE", metadata=log_meta)
-    else:
-        active_logger.info(f"[NODE_EXEC_COMPLETE] TaskFetchingUnit node: Returning. All completed: {return_update.get('all_completed')}, Has ready: {return_update.get('has_ready_tasks')}, Error: '{return_update.get('execution_error')}' (node_name=task_fetching_unit_node)") # type: ignore
+    log_meta = {
+        "node_name": "task_fetching_unit_node",
+        "all_completed": return_update.get("all_completed"),
+        "has_ready_tasks": return_update.get("has_ready_tasks"),
+        "error": return_update.get("execution_error")
+    }
+    active_logger.info(f"TaskFetchingUnit node: Returning. All completed: {log_meta['all_completed']}, Has ready: {log_meta['has_ready_tasks']}, Error: '{log_meta['error']}'", 
+        event_type="NODE_EXEC_COMPLETE", metadata=log_meta)
     return return_update
 
 
@@ -337,14 +273,11 @@ async def executor_module(state: AgentState) -> Dict[str, Any]:
     With the current TaskFetchingUnit.process_dag handling batch execution, this node's role
     might be for specific scenarios like single task retries if the graph routes here.
     """
-    active_logger: Union[MochiLogger, logging.Logger] = state.logger or module_logger
+    active_logger: MochiLogger = state.logger or module_logger
     if state.logger is None:
         module_logger.warning("Executor_module: MochiLogger not found in input state. Using default module_logger.")
     
-    if isinstance(active_logger, MochiLogger):
-        active_logger.info("--- Executor Module: Executing ---", event_type="NODE_EXEC_START", metadata={"node_name": "executor_module"})
-    else:
-        active_logger.info("[NODE_EXEC_START] --- Executor Module: Executing --- (node_name=executor_module)")
+    active_logger.info("--- Executor Module: Executing ---", event_type="NODE_EXEC_START", metadata={"node_name": "executor_module"})
 
     tfu_instance: Optional[TaskFetchingUnit] = state.task_fetching_unit_instance
     task_id_to_execute: Optional[str] = state.current_task_id_to_execute
@@ -434,7 +367,7 @@ async def executor_module(state: AgentState) -> Dict[str, Any]:
 
 async def joiner_node(state: AgentState) -> AgentState:
     """Runs the Joiner module to synthesize results and decide on replanning."""
-    active_logger: Union[MochiLogger, logging.Logger] = state.logger or module_logger
+    active_logger: MochiLogger = state.logger or module_logger
     if state.logger is None:
         module_logger.warning("Joiner_node: MochiLogger not found in input state. Using default module_logger.")
         
@@ -449,10 +382,7 @@ async def joiner_node(state: AgentState) -> AgentState:
 
     if not joiner_instance:
         log_message = "Joiner service instance not found in state (checked 'joiner_instance' and 'services.joiner')."
-        if isinstance(active_logger, MochiLogger):
-            active_logger.error(log_message, event_type="NODE_ERROR", metadata={"node_name": "joiner_node"})
-        else:
-            active_logger.error(f"[NODE_ERROR] {log_message}")
+        active_logger.error(log_message, event_type="NODE_ERROR", metadata={"node_name": "joiner_node"})
 
         # Create a new state for returning, ensuring service instances are by reference
         new_state_data_on_error = {}
@@ -489,17 +419,11 @@ async def joiner_node(state: AgentState) -> AgentState:
 
     if query is None:
         log_message = "Joiner Node: Input query is missing from state."
-        if isinstance(active_logger, MochiLogger):
-            active_logger.error(log_message, event_type="NODE_ERROR", metadata={"node_name": "joiner_node"})
-        else:
-            active_logger.error(f"[NODE_ERROR] {log_message}")
+        active_logger.error(log_message, event_type="NODE_ERROR", metadata={"node_name": "joiner_node"})
         return {**state, "joiner_error": "Input query missing", "needs_replanning": False}
 
     try:
-        if isinstance(active_logger, MochiLogger):
-            active_logger.info("Joiner node: Invoking joiner_instance.process_results", event_type="JOINER_INVOKE_START", metadata={"node_name": "joiner_node"})
-        else:
-            active_logger.info("[JOINER_INVOKE_START] Joiner node: Invoking joiner_instance.process_results")
+        active_logger.info("Joiner node: Invoking joiner_instance.process_results", event_type="JOINER_INVOKE_START", metadata={"node_name": "joiner_node"})
         
         joiner_result = await joiner_instance.process_results(
             query=query,
@@ -512,10 +436,7 @@ async def joiner_node(state: AgentState) -> AgentState:
         )
         
         log_message = f"Joiner node: joiner_instance.process_results call COMPLETED. Needs Replan: {joiner_result.get('needs_replanning')}"
-        if isinstance(active_logger, MochiLogger):
-            active_logger.info(log_message, event_type="JOINER_INVOKE_SUCCESS", metadata={"node_name": "joiner_node", "needs_replanning": joiner_result.get('needs_replanning'), "has_error": joiner_result.get("error") is not None}) # type: ignore
-        else:
-            active_logger.info(f"[JOINER_INVOKE_SUCCESS] {log_message}")
+        active_logger.info(log_message, event_type="JOINER_INVOKE_SUCCESS", metadata={"node_name": "joiner_node", "needs_replanning": joiner_result.get('needs_replanning'), "has_error": joiner_result.get("error") is not None}) # type: ignore
             
         # MODIFIED: Safe state copy and update
         new_state_data = state.model_dump(exclude_none=False)
@@ -545,10 +466,7 @@ async def joiner_node(state: AgentState) -> AgentState:
         return updated_state
     except Exception as e:
         log_message = f"Joiner node: Unhandled exception during joiner processing: {e}"
-        if isinstance(active_logger, MochiLogger):
-            active_logger.error(log_message, event_type="NODE_ERROR", exc_info=True, metadata={"node_name": "joiner_node"})
-        else:
-            active_logger.error(f"[NODE_ERROR] {log_message}", exc_info=True)
+        active_logger.error(log_message, event_type="NODE_ERROR", exc_info=True, metadata={"node_name": "joiner_node"})
 
         # MODIFIED: Safe state copy for error path
         new_state_data_on_error = {}
@@ -576,15 +494,12 @@ async def joiner_node(state: AgentState) -> AgentState:
         return return_state_on_error
 
 def format_response(state: AgentState) -> Dict[str, Any]:
-    active_logger: Union[MochiLogger, logging.Logger] = state.logger or module_logger
+    active_logger: MochiLogger = state.logger or module_logger
     if state.logger is None:
         module_logger.warning("FormatResponse: MochiLogger not found in input state. Using default module_logger.")
     
     node_metadata = {"node_name": "format_response"}
-    if isinstance(active_logger, MochiLogger):
-        active_logger.info("--- Formatting Final Response ---", event_type="NODE_EXEC_START", metadata=node_metadata)
-    else:
-        active_logger.info("[NODE_EXEC_START] --- Formatting Final Response --- (node_name=format_response)")
+    active_logger.info("--- Formatting Final Response ---", event_type="NODE_EXEC_START", metadata=node_metadata)
 
     final_response_from_state = state.final_response
     error_message_detail = state.error_message
@@ -597,10 +512,7 @@ def format_response(state: AgentState) -> Dict[str, Any]:
     else:
         calculated_final_response = "No response generated and no error reported."
 
-    if isinstance(active_logger, MochiLogger):
-        active_logger.info(f"FormatResponse: Final response to be returned: {calculated_final_response[:200]}...")
-    else:
-        active_logger.info(f"[INFO] FormatResponse: Final response to be returned: {calculated_final_response[:200]}...") # Generic log
+    active_logger.info(f"FormatResponse: Final response to be returned: {calculated_final_response[:200]}...")
     
     # Apply final updates to the state object directly
     state.final_response = calculated_final_response
@@ -608,10 +520,7 @@ def format_response(state: AgentState) -> Dict[str, Any]:
     state.error_message = None # Clear any previous error
     state.logger = active_logger # Ensure the active logger is on the state being returned
 
-    if isinstance(active_logger, MochiLogger):
-        active_logger.info(f"FormatResponse: Node returning. Final Response: '{state.final_response}'. Overall Status: '{state.overall_status}'.", event_type="NODE_EXEC_COMPLETE", metadata={"node_name": "format_response"})
-    else:
-        active_logger.info(f"[NODE_EXEC_COMPLETE] FormatResponse: Node returning. Final Response: '{state.final_response}'. Overall Status: '{state.overall_status}'. (node_name=format_response)")
+    active_logger.info(f"FormatResponse: Node returning. Final Response: '{state.final_response}'. Overall Status: '{state.overall_status}'.", event_type="NODE_EXEC_COMPLETE", metadata={"node_name": "format_response"})
     
     return state.model_dump(exclude_none=False) # Return the modified state as a dict
 
@@ -623,16 +532,13 @@ async def handle_no_plan_query(state: AgentState) -> AgentState:
     """Handles queries initially classified as NO_PLAN by the planner,
     by setting them up for a direct conversational response via the Joiner.
     """
-    active_logger: Union[MochiLogger, logging.Logger] = state.logger or module_logger
+    active_logger: MochiLogger = state.logger or module_logger
     if state.logger is None:
         module_logger.warning("handle_no_plan_query: MochiLogger not found in input state. Using module_logger.")
 
     user_query = state.original_query
 
-    if isinstance(active_logger, MochiLogger):
-        active_logger.info(f"Node: handle_no_plan_query for query: '{user_query}'. Setting type to NO_PLAN_CONVERSE for Joiner.", event_type="NODE_EXECUTION")
-    else:
-        active_logger.info(f"[NODE_EXECUTION] Node: handle_no_plan_query for query: '{user_query}'. Setting type to NO_PLAN_CONVERSE for Joiner.") # type: ignore
+    active_logger.info(f"Node: handle_no_plan_query for query: '{user_query}'. Setting type to NO_PLAN_CONVERSE for Joiner.", event_type="NODE_EXECUTION")
 
     # MODIFIED: Safe state copy and update
     new_state_data = state.model_dump(exclude_none=False)
@@ -666,24 +572,18 @@ async def handle_no_plan_query(state: AgentState) -> AgentState:
     new_state_data['has_ready_tasks'] = False
     new_state_data['all_completed'] = True # For NO_PLAN, graph effectively ends execution part.
 
-    if isinstance(active_logger, MochiLogger):
-        active_logger.info(f"handle_no_plan_query: State prepared for Joiner (NO_PLAN_CONVERSE).", event_type="NODE_EXECUTION_RESULT")
-    else:
-        active_logger.info(f"[NODE_EXECUTION_RESULT] handle_no_plan_query: State prepared for Joiner (NO_PLAN_CONVERSE).") # type: ignore
+    active_logger.info(f"handle_no_plan_query: State prepared for Joiner (NO_PLAN_CONVERSE).", event_type="NODE_EXECUTION_RESULT")
 
     updated_state = AgentState(**new_state_data)
     return updated_state 
 
 async def dag_repair_node(state: AgentState) -> Dict[str, Any]:
     """Applies repair instructions to the current DAG if available."""
-    active_logger: Union[MochiLogger, logging.Logger] = state.logger or module_logger
+    active_logger: MochiLogger = state.logger or module_logger
     if state.logger is None:
         module_logger.warning("DAGRepairNode: MochiLogger not found in input state. Using module_logger.")
 
-    if isinstance(active_logger, MochiLogger):
-        active_logger.info("--- DAG Repair Node: Executing ---", event_type="NODE_EXEC_START", metadata={"node_name": "dag_repair_node"})
-    else:
-        active_logger.info("[NODE_EXEC_START] --- DAG Repair Node: Executing --- (node_name=dag_repair_node)")
+    active_logger.info("--- DAG Repair Node: Executing ---", event_type="NODE_EXEC_START", metadata={"node_name": "dag_repair_node"})
 
     dag_editor_instance: Optional[DAGEditor] = state.dag_editor_instance
     current_dag: Optional[TaskDAG] = state.task_dag # task_dag instead of dag
@@ -750,8 +650,5 @@ async def dag_repair_node(state: AgentState) -> Dict[str, Any]:
         return_update["repair_instructions_available"] = False
         return_update["dag_repair_instructions"] = None
 
-    if isinstance(active_logger, MochiLogger):
-        active_logger.info(f"DAGRepairNode: Returning. Repaired DAG: {return_update['task_dag'] is not current_dag if return_update['task_dag'] else False}, Error: '{return_update['dag_repair_error']}'", event_type="NODE_EXEC_COMPLETE", metadata={"node_name": "dag_repair_node"})
-    else:
-        active_logger.info(f"[NODE_EXEC_COMPLETE] DAGRepairNode: Returning. Repaired DAG: {return_update['task_dag'] is not current_dag if return_update['task_dag'] else False}, Error: '{return_update['dag_repair_error']}' (node_name=dag_repair_node)")
+    active_logger.info(f"DAGRepairNode: Returning. Repaired DAG: {return_update['task_dag'] is not current_dag if return_update['task_dag'] else False}, Error: '{return_update['dag_repair_error']}'", event_type="NODE_EXEC_COMPLETE", metadata={"node_name": "dag_repair_node"})
     return return_update 

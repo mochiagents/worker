@@ -1,10 +1,11 @@
 import json
 from typing import List, Dict, Optional, Any, Union
-import logging
 
 from langchain_core.prompts import (
     PromptTemplate,
 )
+from worker.core.logging import MochiLogger
+from worker.config import get_settings
 
 # Placeholder for ServerToolSchemaGroup if direct import is an issue
 # In a typed environment, this would be: from worker.core.models import ServerToolSchemaGroup
@@ -389,7 +390,7 @@ class PlannerPromptBuilder:
         """
         Initializes the PlannerPromptBuilder.
         """
-        self.logger = logging.getLogger(f"mochi.{self.__class__.__name__}")
+        self.logger = MochiLogger(config=get_settings().logging)
 
     def _format_tool_schemas_for_prompt(self, tool_schemas: List[ServerToolSchemaGroup]) -> str:
         """Formats the list of ServerToolSchemaGroup Pydantic models into a JSON string for the prompt."""

@@ -1,6 +1,5 @@
 import os
 from typing import Optional, Dict, Any
-import logging
 
 # LangChain imports
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -9,6 +8,8 @@ from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.chat_models import ChatOllama 
 from worker.config.models import MochiWorkerConfig, LLMConfigEntry
+from worker.core.logging import MochiLogger
+from worker.config import get_settings
 
 class LLMServiceError(Exception):
     """Custom exception for LLMService errors."""
@@ -17,7 +18,7 @@ class LLMServiceError(Exception):
 class LLMService:
     """Provides instances of LangChain LLMs based on named configuration profiles."""
 
-    def __init__(self, config: MochiWorkerConfig, logger_instance: Optional[logging.Logger] = None):
+    def __init__(self, config: MochiWorkerConfig, logger_instance: Optional[MochiLogger] = None):
         """
         Initializes the LLMService.
 
@@ -28,7 +29,7 @@ class LLMService:
         if not isinstance(config, MochiWorkerConfig):
             raise LLMServiceError("LLMService must be initialized with a MochiWorkerConfig instance.")
         self.config = config
-        self.logger = logger_instance or logging.getLogger(f"mochi.{self.__class__.__name__}")
+        self.logger = logger_instance or MochiLogger(config=get_settings().logging)
         self.logger.info("LLMService initialized.")
 
     def _get_api_key(self, provider: str, configured_key: Optional[str]) -> Optional[str]:

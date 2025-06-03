@@ -2,13 +2,14 @@ from typing import Dict, Any, List, Optional
 import json # For potential debugging or logging if needed.
 from worker.core.models import TaskDAG, TaskNode # Core Pydantic models
 from worker.core.logging import MochiLogger # For logging within the editor
+from worker.config import get_settings
 
 class DAGEditor:
     """
     Responsible for applying repair instructions to a TaskDAG.
     """
     def __init__(self, logger: Optional[MochiLogger] = None):
-        self.logger = logger or MochiLogger() # Basic default logger
+        self.logger = logger or MochiLogger(config=get_settings().logging) # Basic default logger
 
     def apply_repair(self, current_dag: TaskDAG, repair_instructions: Dict[str, Any]) -> TaskDAG:
         """

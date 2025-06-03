@@ -6,7 +6,7 @@ from typing import Dict, Any, Union, Optional
 
 from .models import MochiWorkerConfig
 
-logger = logging.getLogger(f"mochi.{__name__}")
+logger = logging.getLogger(__name__)
 
 def _parse_value(value: str) -> Any:
     """Attempt to parse string value to bool, int, float, or keep as string."""

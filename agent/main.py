@@ -10,12 +10,14 @@ import asyncio
 import uuid 
 import signal
 import time
+from datetime import datetime, timezone
 
 from worker.config.manager import ConfigurationManager
 from worker.config.models import MochiWorkerConfig
 from worker.core.logging import MochiLogger
 from worker.core.state_manager import StateManager
 from worker.core.llm_service import LLMService, LLMServiceError
+from worker.core.heartbeat import HeartbeatManager, HealthMetrics, HealthAlert
 from worker.agent.planner import Planner
 from worker.agent.execution import TaskFetchingUnit
 from worker.agent.joiner import Joiner
@@ -151,8 +153,46 @@ class MochiAgent:
         
         self.agent_id = self.config.agent_id
         self.shutdown_event = asyncio.Event()
-        self._heartbeat_task: Optional[asyncio.Task] = None
+        
+        # Initialize the enhanced heartbeat system
+        self.heartbeat_manager = HeartbeatManager(
+            agent_id=self.agent_id,
+            interval_seconds=self.config.agent_settings.heartbeat_interval_seconds,
+            logger=self.logger,
+            enable_system_metrics=True,
+            enable_alerts=True,
+            metrics_history_size=100
+        )
+        self.logger.info("HeartbeatManager initialized.", event_type="COMPONENT_INIT")
+        
         self.logger.info(f"[AGENT_INIT_COMPLETE] Mochi Agent initialized successfully.", event_type="AGENT_INIT_COMPLETE")
+
+    def _update_heartbeat_task_counters(self, active: Optional[int] = None, completed_delta: int = 0, failed_delta: int = 0):
+        """Update task counters in the heartbeat manager."""
+        if hasattr(self, 'heartbeat_manager'):
+            self.heartbeat_manager.update_task_counters(
+                active=active,
+                completed_delta=completed_delta,
+                failed_delta=failed_delta,
+                last_successful=time.time() if completed_delta > 0 else None
+            )
+
+    def _update_heartbeat_mcp_counters(self):
+        """Update MCP connection counters in the heartbeat manager."""
+        if hasattr(self, 'heartbeat_manager') and hasattr(self, 'mcp_clients'):
+            active_connections = len([c for c in self.mcp_clients.values() if getattr(c, '_is_initialized', False)])
+            failed_connections = len([c for c in self.mcp_clients.values() if not getattr(c, '_is_initialized', False)])
+            self.heartbeat_manager.update_mcp_counters(active_connections, failed_connections)
+
+    def add_health_alert(self, alert: HealthAlert):
+        """Add a custom health alert to the heartbeat system."""
+        if hasattr(self, 'heartbeat_manager'):
+            self.heartbeat_manager.add_alert(alert)
+
+    def add_health_callback(self, callback):
+        """Add a health monitoring callback to the heartbeat system."""
+        if hasattr(self, 'heartbeat_manager'):
+            self.heartbeat_manager.add_health_callback(callback)
 
     def _format_history_for_prompt(self, history: List[Dict[str, str]]) -> str:
         """Formats a list of message dictionaries into a single string for the prompt."""
@@ -292,21 +332,10 @@ Avoid technical jargon. Be polite and helpful.
                     self.logger.error(f"Failed to initialize MCP client {server_id}: {results[i]}", event_type="MCP_CLIENT_INIT_FAILURE")
                 else:
                     self.logger.info(f"MCP client {server_id} initialized successfully via async call.", event_type="MCP_CLIENT_INIT_SUCCESS")
+            
+            # Update MCP connection counters after initialization attempts
+            self._update_heartbeat_mcp_counters()
         self.logger.info("Async MCP client initialization complete.", event_type="MCP_CLIENT_INIT_BATCH_COMPLETE")
-
-    async def _run_heartbeat(self):
-        """Background task to periodically log a heartbeat message."""
-        interval = self.config.agent_settings.heartbeat_interval_seconds
-        self.logger.info(f"Heartbeat task started with interval {interval} seconds.", event_type="HEARTBEAT_START")
-        while not self.shutdown_event.is_set():
-            try:
-                await asyncio.wait_for(self.shutdown_event.wait(), timeout=interval)
-                # If wait() completes without timeout, shutdown was signaled
-                break
-            except asyncio.TimeoutError:
-                # Timeout occurred, time for a heartbeat
-                self.logger.info(f"Agent Heartbeat. Agent ID: {self.agent_id}", event_type="HEARTBEAT_PULSE")
-        self.logger.info("Heartbeat task stopping due to shutdown signal.", event_type="HEARTBEAT_STOP")
 
     async def start(self):
         """
@@ -316,15 +345,18 @@ Avoid technical jargon. Be polite and helpful.
         self.logger.info("MochiAgent starting asynchronously...")
         await self._initialize_mcp_clients()
         
-        # Start heartbeat task if enabled
+        # Update MCP connection counters after initialization
+        self._update_heartbeat_mcp_counters()
+        
+        # Start enhanced heartbeat system if enabled
         if self.config.agent_settings.enable_heartbeat:
-            if self._heartbeat_task is None or self._heartbeat_task.done():
-                self.logger.info("Starting heartbeat background task.")
-                self._heartbeat_task = asyncio.create_task(self._run_heartbeat())
+            if not self.heartbeat_manager.is_running:
+                self.logger.info("Starting enhanced heartbeat system.")
+                await self.heartbeat_manager.start()
             else:
-                 self.logger.warning("Heartbeat task already running.")
+                self.logger.warning("Heartbeat system already running.")
         else:
-             self.logger.info("Heartbeat is disabled by configuration.")
+            self.logger.info("Heartbeat is disabled by configuration.")
 
         self.logger.info("MochiAgent async start sequence complete.", event_type="AGENT_START_COMPLETE")
 
@@ -340,16 +372,14 @@ Avoid technical jargon. Be polite and helpful.
         self.logger.info(f"Shutdown initiated by signal {signal_name}...", event_type="AGENT_SHUTDOWN_START")
         self.shutdown_event.set()
 
-        # Cancel heartbeat task
-        if self._heartbeat_task and not self._heartbeat_task.done():
-            self.logger.info("Cancelling heartbeat task...")
-            self._heartbeat_task.cancel()
+        # Stop enhanced heartbeat system
+        if hasattr(self, 'heartbeat_manager') and self.heartbeat_manager.is_running:
+            self.logger.info("Stopping enhanced heartbeat system...")
             try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                self.logger.info("Heartbeat task successfully cancelled.")
+                await self.heartbeat_manager.stop()
+                self.logger.info("Heartbeat system successfully stopped.")
             except Exception as e:
-                 self.logger.error(f"Error during heartbeat task cancellation: {e}", exc_info=True)
+                self.logger.error(f"Error during heartbeat system shutdown: {e}", exc_info=True)
         
         self.logger.info("[AGENT_SHUTDOWN_START] MochiAgent shutting down asynchronously...", event_type="AGENT_SHUTDOWN_START")
         tasks = []
@@ -392,6 +422,12 @@ Avoid technical jargon. Be polite and helpful.
             self.logger.info(f"Starting graph invocation for current DAG. Attempt {loop_count + 1}/{max_dag_replanning_cycles}. Run_id: {current_iteration_state_dict.get('run_id')}, Phase: {current_iteration_state_dict.get('current_phase_id', 'N/A')}", event_type="AGENT_GRAPH_LOOP_START")
             if stream_callback:
                 stream_callback({"event_type": "graph_loop_start", "loop_count": loop_count + 1, "max_loops": max_dag_replanning_cycles, "current_state": current_iteration_state_dict.copy()})
+            
+            # Update active task count for heartbeat monitoring
+            dag_model = current_iteration_state_dict.get('task_dag')
+            if dag_model and isinstance(dag_model, dict) and 'tasks' in dag_model:
+                active_task_count = len(dag_model['tasks'])
+                self._update_heartbeat_task_counters(active=active_task_count)
             
             # Invoke the graph. The input current_iteration_state_dict is a dictionary.
             # The output from lang_graph.ainvoke is an AddableValuesDict (a LangGraph internal type).
@@ -444,6 +480,16 @@ Avoid technical jargon. Be polite and helpful.
                 self.logger.info(f"Graph attempt {loop_count + 1}: Replanning not needed for current DAG. Exiting graph execution loop.", event_type="AGENT_GRAPH_LOOP_EXIT_NO_REPLAN")
                 if stream_callback:
                     stream_callback({"event_type": "graph_loop_exit_no_replan", "final_state": current_iteration_state_dict.copy()})
+                
+                # Update task completion metrics in heartbeat system
+                task_results = current_iteration_state_dict.get("task_results", {})
+                completed_count = len([r for r in task_results.values() if r and not str(r).startswith("Error")])
+                failed_count = len([r for r in task_results.values() if r and str(r).startswith("Error")])
+                if completed_count > 0:
+                    self._update_heartbeat_task_counters(completed_delta=completed_count)
+                if failed_count > 0:
+                    self._update_heartbeat_task_counters(failed_delta=failed_count)
+                
                 break
             else:
                 loop_count += 1 # Increment before next iteration
@@ -904,6 +950,12 @@ Avoid technical jargon. Be polite and helpful.
                                  "error_present": bool(agent_state_model.error_message)
                                  })
             
+            # Update heartbeat metrics based on query completion
+            if agent_state_model.overall_status == "completed_successfully":
+                self._update_heartbeat_task_counters(completed_delta=1)
+            elif agent_state_model.overall_status in ["failed", "needs_clarification"]:
+                self._update_heartbeat_task_counters(failed_delta=1)
+            
             # === BEGIN ADDED CORRECTIVE LOGIC FOR all_completed IN FINALLY BLOCK ===
             terminal_statuses = ["completed_successfully", "failed", "completed_with_clarification_failed"]
             if agent_state_model.overall_status in terminal_statuses and not agent_state_model.all_completed:
@@ -1023,6 +1075,43 @@ Avoid technical jargon. Be polite and helpful.
         except Exception as e:
             self.logger.error(f"Failed to start CLI: {e}", exc_info=True, event_type="CLI_ERROR")
 
+    def get_agent_status(self) -> Dict[str, Any]:
+        """Returns the current status and health of the agent."""
+        base_status = {
+            "agent_id": self.agent_id,
+            "status": "running" if not self.shutdown_event.is_set() else "shutting_down",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "config": {
+                "mcp_servers_configured": len(self.config.mcp_tool_servers) if self.config.mcp_tool_servers else 0,
+                "mcp_clients_active": len([c for c in self.mcp_clients.values() if getattr(c, '_is_initialized', False)]),
+                "heartbeat_enabled": self.config.agent_settings.enable_heartbeat
+            },
+            "conversations": {
+                "active_conversations": len(self.managed_conversation_histories),
+                "total_messages": sum(len(history) for history in self.managed_conversation_histories.values())
+            }
+        }
+        
+        # Add health information from heartbeat system
+        if hasattr(self, 'heartbeat_manager') and self.heartbeat_manager.is_running:
+            health_summary = self.heartbeat_manager.get_health_summary()
+            base_status.update({"health": health_summary})
+        
+        return base_status
+
+    def get_health_metrics(self, limit: Optional[int] = None) -> Dict[str, Any]:
+        """Get detailed health metrics from the heartbeat system."""
+        if not hasattr(self, 'heartbeat_manager') or not self.heartbeat_manager.is_running:
+            return {"error": "Heartbeat system not running"}
+        
+        current_metrics = self.heartbeat_manager.get_current_metrics()
+        metrics_history = self.heartbeat_manager.get_metrics_history(limit)
+        
+        return {
+            "current": current_metrics.to_dict() if current_metrics else None,
+            "history": [m.to_dict() for m in metrics_history],
+            "summary": self.heartbeat_manager.get_health_summary()
+        }
 
 if __name__ == "__main__":
     async def execute_agent_actions():

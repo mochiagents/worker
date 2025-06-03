@@ -3,9 +3,11 @@
 including data structures for tasks, agent state, tool schemas, and execution results.
 These models provide data validation, serialization, and clear type hinting.
 """
-from typing import List, Dict, Any, Optional, Literal, Union
+from typing import List, Dict, Any, Optional, Literal, Union, TYPE_CHECKING
 from pydantic import BaseModel, Field, ConfigDict
-from ..core.logging import MochiLogger # ADDED IMPORT
+
+if TYPE_CHECKING:
+    from worker.core.logging import MochiLogger
 
 # Forward declaration or ensure ToolExecutionResult is defined before TaskNode if not already.
 # For now, assuming ToolExecutionResult will be defined later in the file, Pydantic handles forward references.
@@ -146,7 +148,7 @@ class AgentState(BaseModel):
     dag_editor_instance: Optional[Any] = Field(None, exclude=True, description="Instance of the DAGEditor.")
     # NEW FIELDS END
     
-    logger: Optional[MochiLogger] = Field(default=None, exclude=True, description="Instance of MochiLogger for logging within graph execution. Excluded from serialization.") # ADDED LOGGER FIELD HERE
+    logger: Optional[Any] = Field(default=None, exclude=True, description="Instance of MochiLogger for logging within graph execution. Excluded from serialization.") # ADDED LOGGER FIELD HERE
 
     replan_context: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Contextual information for replanning, such as previous errors or partial results.") # ADDED FIELD
 
@@ -380,7 +382,7 @@ HierarchicalPlan.model_rebuild()
 ToolExecutionResult.model_rebuild() # Definition that TaskNode.raw_output refers to
 TaskNode.model_rebuild()          # Contains forward ref: raw_output: Optional['ToolExecutionResult']
 TaskDAG.model_rebuild()           # Contains List[TaskNode]
-AgentState.model_rebuild()        # Contains TaskDAG and task_results: Dict[str, ToolExecutionResult]
+# AgentState.model_rebuild()        # Contains TaskDAG and task_results: Dict[str, ToolExecutionResult] - COMMENTED OUT to avoid MochiLogger resolution issue
 
 # Repair action models (rebuild if they also have internal forward refs or complex structures)
 ModifyTaskInputsRepairAction.model_rebuild()
