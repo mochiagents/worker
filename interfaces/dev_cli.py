@@ -31,6 +31,9 @@ class MochiCLI:
         self.current_conversation_id: Optional[str] = None # Added for managed queries
         self.current_dag_tree: Optional[Tree] = None
         self.current_task_statuses: Dict[str, str] = {}
+        
+        # Enable detailed Joiner debugging (can be controlled by CLI flags)
+        self._show_joiner_prompts = False  # Will be set to True in verbose mode
 
     def _create_parser(self):
         """Create the argument parser based on the designed command structure."""
@@ -131,6 +134,12 @@ class MochiCLI:
                         try:
                             self.agent = MochiAgent(config_path=args.config if args.config else None)
                             agent_initialized_successfully = True
+                            
+                            # Enable detailed Joiner debugging in verbose mode
+                            if args.verbose:
+                                self._show_joiner_prompts = True
+                                self.console.print("[dim yellow]Verbose mode enabled: Detailed Joiner analysis will be shown[/dim yellow]")
+                                
                         except MochiConfigError as mce:
                             self.console.print(Panel(
                                 Text(f"Configuration Error: {escape(str(mce))}\n\nPlease check your 'worker_config.yaml' (or the specified config file). Ensure that required LLM profiles (e.g., 'planner.llm_profile_name', 'joiner.llm_profile_name') are defined and point to valid entries in the 'llm_profiles' section. Also verify MCP tool server configurations.", style="bold red"), 
@@ -618,6 +627,95 @@ class MochiCLI:
                 self.console.print(f"    [red]🤝 Joiner Error:[/red] {event_data.get('error_message')}")
             else:
                 self.console.print(f"    [green]🤝 Joiner End.[/green] Final response might be available.")
+        
+        # === NEW JOINER STREAM EVENTS ===
+        elif event_type == "joiner_analysis_start":
+            query_preview = event_data.get('query', 'N/A')
+            total_tasks = event_data.get('total_tasks', 0)
+            completed_tasks = event_data.get('completed_tasks', 0)
+            failed_tasks = event_data.get('failed_tasks', 0)
+            self.console.print(f"      [cyan]🧠 Joiner Analysis:[/cyan] Analyzing {total_tasks} tasks ({completed_tasks} completed, {failed_tasks} failed)")
+            self.console.print(f"      [dim]Query: {query_preview}[/dim]")
+        
+        elif event_type == "joiner_llm_invoke_start":
+            self.console.print(f"      [blue]🤖 Joiner LLM:[/blue] {event_data.get('message', 'Invoking analysis...')}")
+        
+        elif event_type == "joiner_prompt_generated":
+            prompt_length = event_data.get('prompt_length', 0)
+            self.console.print(f"      [blue]📝 Joiner Prompt:[/blue] Generated prompt ({prompt_length} characters)")
+            # Optionally show full prompt for detailed debugging (can be toggled based on verbosity)
+            full_prompt = event_data.get('full_prompt', '')
+            if full_prompt and hasattr(self, '_show_joiner_prompts') and self._show_joiner_prompts:
+                self.console.print(Panel(
+                    Text(full_prompt, style="dim white"),
+                    title="📝 Full Joiner Prompt (Debug)",
+                    border_style="blue",
+                    expand=False
+                ))
+        
+        elif event_type == "joiner_llm_response_received":
+            response_length = event_data.get('response_length', 0)
+            full_response = event_data.get('full_response', '')
+            self.console.print(f"      [green]🤖 Joiner LLM Response:[/green] Received {response_length} characters")
+            # Show the actual Joiner's reasoning (this is the key addition!)
+            if full_response:
+                # Format the response nicely for CLI display
+                self.console.print(Panel(
+                    Text(full_response, style="white"),
+                    title="🧠 Joiner's Internal Analysis & Reasoning",
+                    border_style="cyan",
+                    expand=False
+                ))
+        
+        elif event_type == "joiner_decision_replan_yes":
+            reasoning = event_data.get('reasoning', 'No reasoning provided')
+            self.console.print(f"      [yellow]🔄 Joiner Decision:[/yellow] REPLAN NEEDED")
+            self.console.print(f"      [dim]Reasoning: {reasoning[:100]}{'...' if len(reasoning) > 100 else ''}[/dim]")
+        
+        elif event_type == "joiner_decision_replan_no":
+            response_preview = event_data.get('response_preview', 'No response preview')
+            self.console.print(f"      [green]✅ Joiner Decision:[/green] NO REPLAN NEEDED")
+            self.console.print(f"      [dim]Response preview: {response_preview[:100]}{'...' if len(response_preview) > 100 else ''}[/dim]")
+        
+        elif event_type == "joiner_user_response_extracted":
+            user_response = event_data.get('user_response', '')
+            response_length = event_data.get('response_length', 0)
+            self.console.print(f"      [green]📝 Joiner Response:[/green] Extracted final user response ({response_length} chars)")
+            # Show the actual final response that will go to the user
+            if user_response:
+                self.console.print(Panel(
+                    Text(user_response, style="green"),
+                    title="✅ Final User Response (from Joiner)",
+                    border_style="green",
+                    expand=False
+                ))
+        
+        elif event_type == "joiner_explanation_extracted":
+            explanation = event_data.get('explanation', '')
+            explanation_length = event_data.get('explanation_length', 0)
+            self.console.print(f"      [yellow]📋 Joiner Explanation:[/yellow] Extracted reasoning ({explanation_length} chars)")
+            if explanation:
+                self.console.print(Panel(
+                    Text(explanation, style="yellow"),
+                    title="📋 Joiner's Explanation for Decision",
+                    border_style="yellow", 
+                    expand=False
+                ))
+        
+        elif event_type == "joiner_final_decision":
+            needs_replanning = event_data.get('needs_replanning', False)
+            response_type = event_data.get('response_type', 'UNKNOWN')
+            self.console.print(f"      [cyan]🎯 Joiner Final Decision:[/cyan] {'REPLANNING' if needs_replanning else 'PROCEEDING'} ({response_type})")
+        
+        elif event_type == "joiner_parsing_error":
+            message = event_data.get('message', 'Parsing error')
+            self.console.print(f"      [red]⚠️ Joiner Parsing Issue:[/red] {message}")
+        
+        elif event_type == "joiner_parsing_warning":
+            message = event_data.get('message', 'Parsing warning')
+            self.console.print(f"      [yellow]⚠️ Joiner Warning:[/yellow] {message}")
+        # === END NEW JOINER STREAM EVENTS ===
+        
         elif event_type == "graph_loop_end":
             self.console.print(f"  [cyan]🔄 Graph Loop End[/cyan] ({event_data.get('loop_count')})")
             if event_data.get("output_state", {}).get("needs_replanning"):
