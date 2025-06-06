@@ -10,15 +10,9 @@ from .models import (
     JoinerSettings # Added JoinerSettings
 )
 
-# Define the default configuration file path relative to the project root
-# This assumes the application is run from the project root directory.
-# Adjust if the execution context is different.
-DEFAULT_CONFIG_FILE = "worker_config.yaml" 
-
 # Global instance of the Configuration Manager
-# It will first load Pydantic defaults, then try the DEFAULT_CONFIG_FILE,
-# and then can be further updated by environment variables or runtime calls.
-config_manager = ConfigurationManager(default_config_path=DEFAULT_CONFIG_FILE)
+# It will automatically look for worker_config.yaml in the worker's root directory
+config_manager = ConfigurationManager()
 
 # Optionally, load environment variables at startup.
 # Services can also choose to call this explicitly if needed, or it can be part of app bootstrap.

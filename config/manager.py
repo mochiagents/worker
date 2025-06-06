@@ -24,17 +24,38 @@ def _parse_value(value: str) -> Any:
         pass
     return value
 
+def _get_worker_root_dir() -> str:
+    """Get the root directory of the worker package."""
+    # Get the directory of this file (config/manager.py)
+    current_file_dir = os.path.dirname(os.path.abspath(__file__))
+    # Go up one level to get the worker root directory
+    worker_root_dir = os.path.dirname(current_file_dir)
+    return worker_root_dir
+
 class ConfigurationManager:
     def __init__(self, default_config_path: Optional[str] = None):
         self.config: MochiWorkerConfig = MochiWorkerConfig()
 
         path_to_load = default_config_path
         if not path_to_load:
-            cwd_config_path = os.path.join(os.getcwd(), "worker_config.yaml")
-            if os.path.exists(cwd_config_path):
-                path_to_load = cwd_config_path
+            # Look for worker_config.yaml in the worker's root directory instead of CWD
+            worker_root_dir = _get_worker_root_dir()
+            worker_config_path = os.path.join(worker_root_dir, "worker_config.yaml")
+            logger.debug(f"No config path provided, looking for config at: {worker_config_path}")
+            if os.path.exists(worker_config_path):
+                path_to_load = worker_config_path
             else:
-                logger.info("No explicit config path provided and 'worker_config.yaml' not found in CWD. Using Pydantic defaults/env vars initially.")
+                logger.info("No explicit config path provided and 'worker_config.yaml' not found in worker root directory. Using Pydantic defaults/env vars initially.")
+        elif not os.path.isabs(path_to_load) and not os.path.exists(path_to_load):
+            # If the provided path is relative and doesn't exist in CWD, try worker root dir
+            worker_root_dir = _get_worker_root_dir()
+            worker_config_path = os.path.join(worker_root_dir, path_to_load)
+            logger.debug(f"Relative config path provided, checking worker root: {worker_config_path}")
+            if os.path.exists(worker_config_path):
+                path_to_load = worker_config_path
+                logger.info(f"Found config file in worker root directory: {worker_config_path}")
+            else:
+                logger.debug(f"Config file not found in worker root either: {worker_config_path}")
 
         if path_to_load:
             logger.info(f"Attempting to load configuration from: {path_to_load}")
