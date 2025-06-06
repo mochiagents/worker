@@ -622,15 +622,6 @@ Avoid technical jargon. Be polite and helpful.
             strategy = await self.planner._classify_query_planning_strategy(query, conversation_context)
             self.logger.info(f"Query classification result: {strategy}", event_type="QUERY_CLASSIFICATION_END", metadata={"run_id": current_run_id, "strategy": strategy})
 
-            if strategy == "NO_PLAN":
-                agent_state_model.overall_status = "completed_no_plan"
-                agent_state_model.final_response = "This query type does not require a plan. I can answer directly or it's outside my capabilities for planning."
-                self.logger.info("Query classified as NO_PLAN. Returning direct response.", event_type="NO_PLAN_RESPONSE", metadata={"run_id": current_run_id})
-                if stream_callback: 
-                    stream_callback({"event_type": "agent_status_update", "status": agent_state_model.overall_status, "run_id": current_run_id})
-                    stream_callback({"event_type": "final_result", "run_id": current_run_id, "answer": agent_state_model.final_response, "error": None})
-                return {"answer": agent_state_model.final_response, "error": None, "run_id": current_run_id, "agent_state": agent_state_model.model_dump(exclude_none=True)}
-
             # This will hold the AgentState as a dictionary to be passed to _execute_graph_for_state
             # and updated between phases. It includes 'accumulated_global_task_outputs'.
             # For the first phase/simple plan, accumulated_global_task_outputs starts empty.
@@ -646,8 +637,31 @@ Avoid technical jargon. Be polite and helpful.
             phase_specific_agent_state_dict["joiner_instance"] = self.joiner
             phase_specific_agent_state_dict["mcp_clients"] = self.mcp_clients
             phase_specific_agent_state_dict["dag_editor_instance"] = self.dag_editor
+
+            if strategy == "NO_PLAN":
+                self.logger.info("Query classified as NO_PLAN. Setting up for graph execution with joiner.", event_type="NO_PLAN_SETUP", metadata={"run_id": current_run_id})
+                agent_state_model.overall_status = "processing_no_plan"
+                # Set planner_output for NO_PLAN so the graph can route correctly
+                planner_out_dict = {"status": "NO_PLAN query - routing to conversational response", "query_type": "NO_PLAN", "error": None}
+                phase_specific_agent_state_dict["planner_output"] = planner_out_dict
+                agent_state_model.planner_output = planner_out_dict
+                if stream_callback: 
+                    stream_callback({"event_type": "agent_status_update", "status": agent_state_model.overall_status, "run_id": current_run_id})
+                
+                # Execute the graph for NO_PLAN query
+                completed_state_dict = await self._execute_graph_for_state(phase_specific_agent_state_dict, stream_callback)
+                
+                # Update agent_state_model with results from graph execution
+                agent_state_model.final_response = completed_state_dict.get("final_response")
+                agent_state_model.overall_status = completed_state_dict.get("overall_status", "completed_successfully")
+                agent_state_model.error_message = completed_state_dict.get("error_message")
+                
+                if stream_callback:
+                    stream_callback({"event_type": "final_result", "run_id": current_run_id, "answer": agent_state_model.final_response, "error": agent_state_model.error_message})
+                
+                return {"answer": agent_state_model.final_response, "error": agent_state_model.error_message, "run_id": current_run_id, "agent_state": agent_state_model.model_dump(exclude_none=True)}
             
-            if strategy == "COMPLEX":
+            elif strategy == "COMPLEX":
                 self.logger.info("Query classified as COMPLEX. Generating hierarchical plan...", event_type="HIERARCHICAL_PLAN_START", metadata={"run_id": current_run_id})
                 agent_state_model.overall_status = "generating_hierarchical_plan"
                 if stream_callback: stream_callback({"event_type": "agent_status_update", "status": agent_state_model.overall_status, "run_id": current_run_id})
